@@ -141,8 +141,8 @@ class StageA(nn.Module):
         raw = self.head(decoded)
         if self.control_stride > 1:
             coarse_size = (
-                (height + self.control_stride - 1) // self.control_stride,
-                (width + self.control_stride - 1) // self.control_stride,
+                max(2, (height + self.control_stride - 1) // self.control_stride),
+                max(2, (width + self.control_stride - 1) // self.control_stride),
             )
             raw = F.adaptive_avg_pool2d(raw, coarse_size)
             raw = F.interpolate(
@@ -159,17 +159,60 @@ class StageA(nn.Module):
             "confidence": confidence,
         }
 
-    def load_geometry(self, checkpoint: str | Path) -> None:
+    def load_geometry(self, checkpoint: str | Path) -> dict[str, object]:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         state = payload.get("model", payload.get("state_dict", payload))
-        geometry = {
-            key.removeprefix("prior."): value
-            for key, value in state.items()
-            if key.startswith("prior.") and "global_pose_head" not in key
+        expected = {
+            key: value
+            for key, value in self.state_dict().items()
+            if not key.startswith("confidence_head.")
         }
-        current = self.state_dict()
-        current.update(geometry)
-        self.load_state_dict(current)
+        geometry: dict[str, Tensor] = {}
+        checkpoint_geometry_keys: list[str] = []
+        for original_key, value in state.items():
+            key = original_key
+            while key.startswith(("module.", "model.")):
+                key = key.split(".", 1)[1]
+            if not key.startswith("prior."):
+                continue
+            checkpoint_geometry_keys.append(key)
+            geometry[key.removeprefix("prior.")] = value
+
+        missing = sorted(set(expected) - set(geometry))
+        unexpected = sorted(set(geometry) - set(expected))
+        shape_mismatch = sorted(
+            key
+            for key in set(expected) & set(geometry)
+            if expected[key].shape != geometry[key].shape
+        )
+        if missing or unexpected or shape_mismatch:
+            raise RuntimeError(
+                "Stage-A geometry checkpoint does not exactly match the configured "
+                f"prior: missing={missing}, unexpected={unexpected}, "
+                f"shape_mismatch={shape_mismatch}"
+            )
+
+        incompatible = self.load_state_dict(geometry, strict=False)
+        expected_missing = sorted(
+            key for key in self.state_dict() if key.startswith("confidence_head.")
+        )
+        if sorted(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Stage-A load produced an unexpected state-dict result: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+        return {
+            "checkpoint": str(Path(checkpoint).resolve()),
+            "checkpoint_geometry_tensors": len(checkpoint_geometry_keys),
+            "loaded_geometry_tensors": len(geometry),
+            "expected_geometry_tensors": len(expected),
+            "coverage": len(geometry) / len(expected),
+            "flow_head_loaded": {
+                "head.1.weight",
+                "head.1.bias",
+            }.issubset(geometry),
+        }
 
 
 def set_stage_a_trainable(stage_a: StageA, *, confidence_only: bool) -> None:

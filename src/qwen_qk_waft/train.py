@@ -10,19 +10,29 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
 from .config import load_config, resolve_path
 from .data import DocumentMapDataset, tensor_to_pil
-from .geometry import map_jacobian_determinant
+from .geometry import map_jacobian_determinant, valid_map_mask
 from .losses import (
     compute_losses,
     confidence_loss,
     endpoint_error,
-    image_edge_weight,
     masked_mean,
+)
+from .metrics import (
+    calibration_metrics,
+    document_region_masks,
+    gate_histogram,
+    map_curvature_error,
+    masked_minimum,
+    masked_quantile,
+    reconstruction_psnr,
+    reconstruction_ssim,
 )
 from .models.model import QwenQKWAFT
 from .models.qwen_qk import QwenQKExtractor
@@ -105,7 +115,11 @@ def train_confidence(config_path: str | Path) -> None:
         max_displacement_ratio=float(model_config["stage_a_max_displacement_ratio"]),
         control_stride=int(model_config["stage_a_control_stride"]),
     )
-    stage_a.load_geometry(resolve_path(config, model_config["stage_a_checkpoint"]))
+    stage_a_report = stage_a.load_geometry(
+        resolve_path(config, model_config["stage_a_checkpoint"])
+    )
+    if rank == 0:
+        print(json.dumps({"stage_a_initialization": stage_a_report}))
     set_stage_a_trainable(stage_a, confidence_only=True)
     stage_a.to(device)
     model: nn.Module = stage_a
@@ -177,7 +191,9 @@ def _build_model(config: dict[str, Any], selection: dict[str, Any]) -> QwenQKWAF
         resolve_path(config, model_config["waft_checkpoint"])
     )
     print(json.dumps({"waft_initialization": initialization}))
-    model.stage_a.load_geometry(resolve_path(config, model_config["stage_a_checkpoint"]))
+    stage_a_initialization = model.stage_a.load_geometry(
+        resolve_path(config, model_config["stage_a_checkpoint"])
+    )
     confidence = torch.load(
         resolve_path(config, config["phases"]["confidence"]["checkpoint"]),
         map_location="cpu",
@@ -186,6 +202,11 @@ def _build_model(config: dict[str, Any], selection: dict[str, Any]) -> QwenQKWAF
     model.stage_a.confidence_head.load_state_dict(confidence["confidence_head"])
     for parameter in model.stage_a.parameters():
         parameter.requires_grad = False
+    model.initialization_report = {
+        "waft": initialization,
+        "stage_a": stage_a_initialization,
+    }
+    print(json.dumps({"stage_a_initialization": stage_a_initialization}))
     return model
 
 
@@ -213,9 +234,21 @@ def _evaluate(
     selection: Mapping[str, Any],
     phase: Mapping[str, Any],
     device: torch.device,
+    *,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    gate_temperature_px: float,
+    selection_weights: Mapping[str, float],
 ) -> dict[str, float]:
     model.eval()
-    totals = torch.zeros(7, device=device, dtype=torch.float64)
+    totals: dict[str, Tensor] = {}
+    jacobian_minimum = torch.full((), torch.inf, device=device, dtype=torch.float32)
+
+    def add(name: str, value: Tensor) -> None:
+        totals[name] = totals.get(
+            name, torch.zeros((), device=device, dtype=torch.float64)
+        ) + value.detach().to(torch.float64)
+
     for raw_batch in loader:
         batch = _to_device(raw_batch, device)
         queries, keys, _, _ = extractor.selected_pair(
@@ -224,49 +257,121 @@ def _evaluate(
             step=int(selection["step"]),
             variant=str(selection["variant"]),
         )
-        output = model(
-            batch["warped"],
-            queries,
-            keys,
-            iterations=int(phase["iterations"]),
-            use_local_encoder=bool(phase["local_encoder"]),
-            use_gate=bool(phase["gate"]),
-        )
-        final_error = endpoint_error(output["final_map"], batch["map"])
-        prior_error = endpoint_error(output["coarse_map"], batch["map"])
-        edge = image_edge_weight(batch["target"])
-        epe = masked_mean(final_error, batch["valid"])
-        prior_epe = masked_mean(prior_error, batch["valid"])
-        line_epe = masked_mean(final_error * (1 + 4 * edge), batch["valid"])
-        win = masked_mean((final_error < prior_error).float(), batch["valid"])
-        determinant = map_jacobian_determinant(output["final_map"])
-        fold = (determinant <= 0).float().mean()
-        reconstruction = masked_mean(
-            (output["rectified"] - batch["target"]).abs(), batch["valid"]
-        )
-        totals += torch.stack(
-            (
-                epe,
-                prior_epe,
-                line_epe,
-                win,
-                fold,
-                reconstruction,
-                epe.new_ones(()),
+        with torch.autocast(
+            "cuda", dtype=amp_dtype, enabled=amp_enabled
+        ):
+            output = model(
+                batch["warped"],
+                queries,
+                keys,
+                iterations=int(phase["iterations"]),
+                use_local_encoder=bool(phase["local_encoder"]),
+                use_gate=bool(phase["gate"]),
             )
-        ).to(torch.float64)
+        target_map = batch["map"].float()
+        final_map = output["final_map"].float()
+        coarse_map = output["coarse_map"].float()
+        valid = batch["valid"]
+        final_error = endpoint_error(final_map, target_map)
+        prior_error = endpoint_error(coarse_map, target_map)
+        regions = document_region_masks(batch["target"], valid)
+
+        add("epe", masked_mean(final_error, valid))
+        add("epe_p95", masked_quantile(final_error, valid, 0.95))
+        add("prior_epe", masked_mean(prior_error, valid))
+        add("line_epe", masked_mean(final_error, regions["line"]))
+        add("prior_line_epe", masked_mean(prior_error, regions["line"]))
+        add("edge_epe", masked_mean(final_error, regions["page_edge"]))
+        add("corner_epe", masked_mean(final_error, regions["corner"]))
+        add(
+            "line_straightness_error",
+            map_curvature_error(final_map, target_map, regions["line"]),
+        )
+        add(
+            "prior_line_straightness_error",
+            map_curvature_error(coarse_map, target_map, regions["line"]),
+        )
+        add("final_win_rate", masked_mean((final_error < prior_error).float(), valid))
+        residual_error = endpoint_error(
+            final_map - coarse_map, target_map - coarse_map
+        )
+        add("residual_epe", masked_mean(residual_error, valid))
+
+        determinant = map_jacobian_determinant(final_map)
+        fold_valid = valid[:, :, :-1, :-1]
+        add("fold_rate", masked_mean((determinant <= 0).float().unsqueeze(1), fold_valid))
+        jacobian_minimum = torch.minimum(
+            jacobian_minimum,
+            masked_minimum(determinant.unsqueeze(1), fold_valid).float(),
+        )
+        predicted_valid = valid_map_mask(final_map, batch["warped"].shape[-2:])
+        add("invalid_rate", masked_mean((~predicted_valid).float(), valid))
+
+        rectified = output["rectified"].float()
+        target_image = batch["target"].float()
+        add("reconstruction_l1", masked_mean((rectified - target_image).abs(), valid))
+        add("reconstruction_psnr", reconstruction_psnr(rectified, target_image, valid))
+        add("reconstruction_ssim", reconstruction_ssim(rectified, target_image, valid))
+
+        confidence_target = torch.exp(-prior_error / gate_temperature_px)
+        confidence = output["coarse_confidence"].float()
+        confidence_brier, confidence_ece = calibration_metrics(
+            confidence, confidence_target, valid
+        )
+        add("confidence_brier", confidence_brier)
+        add("confidence_ece", confidence_ece)
+        add("high_confidence_epe", masked_mean(final_error, valid & (confidence >= 0.5)))
+        add("low_confidence_epe", masked_mean(final_error, valid & (confidence < 0.5)))
+
+        gate = F.interpolate(
+            output["gates"][-1].float(),
+            target_map.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        gate_target = (prior_error / gate_temperature_px).clamp(0, 1)
+        gate_brier, gate_ece = calibration_metrics(gate, gate_target, valid)
+        add("gate_brier", gate_brier)
+        add("gate_ece", gate_ece)
+        for index, value in enumerate(gate_histogram(gate, valid)):
+            add(f"gate_histogram_{index}", value)
+
+        previous_map = coarse_map
+        for index, iteration_map in enumerate(output["maps"], 1):
+            iteration_map = iteration_map.float()
+            add(
+                f"iteration_{index}_epe",
+                masked_mean(endpoint_error(iteration_map, target_map), valid),
+            )
+            add(
+                f"iteration_{index}_update_px",
+                masked_mean(endpoint_error(iteration_map, previous_map), valid),
+            )
+            previous_map = iteration_map
+        add("samples", final_error.new_ones(()))
     if dist.is_initialized():
-        dist.all_reduce(totals)
-    count = totals[-1].clamp_min(1)
-    return {
-        "epe": float(totals[0] / count),
-        "prior_epe": float(totals[1] / count),
-        "epe_gain": float((totals[1] - totals[0]) / count),
-        "line_epe": float(totals[2] / count),
-        "final_win_rate": float(totals[3] / count),
-        "fold_rate": float(totals[4] / count),
-        "reconstruction_l1": float(totals[5] / count),
-    }
+        for value in totals.values():
+            dist.all_reduce(value)
+        dist.all_reduce(jacobian_minimum, op=dist.ReduceOp.MIN)
+    count = totals.pop("samples").clamp_min(1)
+    result = {name: float(value / count) for name, value in totals.items()}
+    result["jacobian_min"] = float(jacobian_minimum)
+    result["epe_gain"] = result["prior_epe"] - result["epe"]
+    result["line_epe_gain"] = result["prior_line_epe"] - result["line_epe"]
+    result["line_straightness_gain"] = (
+        result["prior_line_straightness_error"]
+        - result["line_straightness_error"]
+    )
+    result["selection_score"] = sum(
+        float(weight) * result[name] for name, weight in selection_weights.items()
+    )
+    result["meets_minimum_geometry_criteria"] = float(
+        result["epe_gain"] > 0
+        and result["final_win_rate"] > 0.5
+        and result["line_epe_gain"] > 0
+        and result["line_straightness_gain"] > 0
+    )
+    return result
 
 
 def train_waft(config_path: str | Path, phase_name: str) -> None:
@@ -367,6 +472,9 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                         loss_weights,
                         sequence_gamma=float(config["loss"]["sequence_gamma"]),
                         gate_temperature_px=float(config["loss"]["gate_temperature_px"]),
+                        required_improvement_px=float(
+                            config["loss"]["required_improvement_px"]
+                        ),
                         min_jacobian=float(config["loss"]["min_jacobian"]),
                     )
                 optimizer.zero_grad(set_to_none=True)
@@ -390,7 +498,16 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                     )
 
             metrics = _evaluate(
-                train_model, extractor, val_loader, selection, phase, device
+                train_model,
+                extractor,
+                val_loader,
+                selection,
+                phase,
+                device,
+                amp_enabled=bool(config["train"]["amp"]),
+                amp_dtype=amp_dtype,
+                gate_temperature_px=float(config["loss"]["gate_temperature_px"]),
+                selection_weights=config["train"]["selection_weights"],
             )
             if rank == 0:
                 payload = {
@@ -401,14 +518,15 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                     "phase": phase_name,
                     "epoch": epoch,
                     "selection": selection,
+                    "initialization": model.initialization_report,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "metrics": metrics,
                 }
                 _save(output_dir / "latest.pt", payload)
                 _save(output_dir / f"epoch_{epoch:04d}.pt", payload)
-                if metrics["line_epe"] < best_value:
-                    best_value = metrics["line_epe"]
+                if metrics["selection_score"] < best_value:
+                    best_value = metrics["selection_score"]
                     _save(output_dir / "best.pt", payload)
                 print(json.dumps({"phase": phase_name, "epoch": epoch, **metrics}))
     if world > 1:

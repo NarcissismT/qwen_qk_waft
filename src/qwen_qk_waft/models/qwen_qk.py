@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import inspect
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,18 @@ _LORA_TARGETS = (
     "txt_mlp.net.2",
     "txt_mod.1",
 )
+
+
+def normalize_lora_key(raw_key: str) -> str:
+    key = raw_key
+    prefixes = ("module.", "model.", "pipe.dit.", "dit.", "transformer.")
+    while True:
+        prefix = next((value for value in prefixes if key.startswith(value)), None)
+        if prefix is None:
+            break
+        key = key[len(prefix) :]
+    key = key.replace(".lora_A.weight", ".lora_A.default.weight")
+    return key.replace(".lora_B.weight", ".lora_B.default.weight")
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -106,7 +119,11 @@ def _standardize_qk(value: Tensor, token_count: int, heads: int) -> Tensor:
     raise ValueError(f"unsupported Q/K shape {tuple(value.shape)}")
 
 
-def _load_lora(transformer: nn.Module, checkpoint: str | Path, scale: float) -> nn.Module:
+def _load_lora(
+    transformer: nn.Module,
+    checkpoint: str | Path,
+    scale: float,
+) -> tuple[nn.Module, dict[str, object]]:
     from peft import LoraConfig, inject_adapter_in_model
     from safetensors.torch import load_file
 
@@ -114,17 +131,13 @@ def _load_lora(transformer: nn.Module, checkpoint: str | Path, scale: float) -> 
     state: dict[str, Tensor] = {}
     ranks = set()
     for raw_key, value in raw.items():
-        key = raw_key
-        for prefix in ("module.", "pipe.dit.", "dit.", "transformer."):
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
-                break
-        key = key.replace(".lora_A.weight", ".lora_A.default.weight")
-        key = key.replace(".lora_B.weight", ".lora_B.default.weight")
+        key = normalize_lora_key(raw_key)
         state[key] = value
         if ".lora_A." in key:
             ranks.add(int(value.shape[0]))
-    rank = ranks.pop()
+    if len(ranks) != 1:
+        raise RuntimeError(f"LoRA checkpoint must contain one rank, found {sorted(ranks)}")
+    rank = next(iter(ranks))
     config = LoraConfig(
         r=rank,
         lora_alpha=float(rank) * float(scale),
@@ -132,8 +145,42 @@ def _load_lora(transformer: nn.Module, checkpoint: str | Path, scale: float) -> 
         bias="none",
     )
     transformer = inject_adapter_in_model(config, transformer)
-    transformer.load_state_dict(state, strict=False)
-    return transformer
+    adapter_state = {
+        key: value
+        for key, value in transformer.state_dict().items()
+        if ".lora_A." in key or ".lora_B." in key
+    }
+    missing = sorted(set(adapter_state) - set(state))
+    unexpected = sorted(set(state) - set(adapter_state))
+    shape_mismatch = sorted(
+        key
+        for key in set(adapter_state) & set(state)
+        if adapter_state[key].shape != state[key].shape
+    )
+    if missing or unexpected or shape_mismatch:
+        raise RuntimeError(
+            "LoRA checkpoint does not exactly match injected adapters: "
+            f"missing={missing}, unexpected={unexpected}, "
+            f"shape_mismatch={shape_mismatch}"
+        )
+    incompatible = transformer.load_state_dict(state, strict=False)
+    unexpected_after_load = sorted(incompatible.unexpected_keys)
+    missing_adapter_after_load = sorted(
+        key for key in incompatible.missing_keys if key in adapter_state
+    )
+    if unexpected_after_load or missing_adapter_after_load:
+        raise RuntimeError(
+            "LoRA load did not cover all adapter parameters: "
+            f"missing={missing_adapter_after_load}, unexpected={unexpected_after_load}"
+        )
+    return transformer, {
+        "checkpoint": str(Path(checkpoint).resolve()),
+        "scale": float(scale),
+        "rank": rank,
+        "checkpoint_tensors": len(state),
+        "matched_tensors": len(adapter_state),
+        "coverage": len(adapter_state) / len(state),
+    }
 
 
 class QwenQKExtractor:
@@ -157,6 +204,12 @@ class QwenQKExtractor:
         self.layers = tuple(int(v) for v in layers)
         self.steps = frozenset(int(v) for v in steps)
         self.variants = frozenset(str(v) for v in variants)
+        self.lora_report: dict[str, object] = {
+            "enabled": False,
+            "scale": float(self.config.get("lora_scale", 1.0)),
+            "checkpoint_tensors": 0,
+            "matched_tensors": 0,
+        }
         self.pipeline = self._load_pipeline()
         block_count = len(self.pipeline.transformer.transformer_blocks)
         self.layers = tuple(v if v >= 0 else block_count + v for v in self.layers)
@@ -185,9 +238,10 @@ class QwenQKExtractor:
         lora_scale = float(self.config.get("lora_scale", 1.0))
         lora_checkpoint = self.config.get("lora_checkpoint")
         if lora_checkpoint and lora_scale > 0:
-            pipeline.transformer = _load_lora(
+            pipeline.transformer, self.lora_report = _load_lora(
                 pipeline.transformer, str(lora_checkpoint), lora_scale
             )
+            self.lora_report["enabled"] = True
         if bool(self.config.get("cpu_offload", False)):
             pipeline.enable_model_cpu_offload(gpu_id=self.device.index or 0)
         else:
@@ -414,6 +468,12 @@ class QwenQKExtractor:
             with contextlib.suppress(Exception):
                 handle.remove()
         self._handles.clear()
+        pipeline = self.pipeline
+        self.pipeline = None
+        del pipeline
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def __enter__(self) -> "QwenQKExtractor":
         return self

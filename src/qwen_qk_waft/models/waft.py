@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -20,6 +21,12 @@ class ConfidenceGate(nn.Module):
             nn.GELU(),
             nn.Conv2d(channels, 1, 3, padding=1),
         )
+        self.initialize_open()
+
+    def initialize_open(self, probability: float = 0.99) -> None:
+        output = self.network[-1]
+        nn.init.zeros_(output.weight)
+        nn.init.constant_(output.bias, math.log(probability / (1.0 - probability)))
 
     def forward(
         self,
@@ -71,6 +78,8 @@ class WAFTRefiner(nn.Module):
             patch_size=patch_size,
             timm_checkpoint=timm_checkpoint,
         )
+        self.refine_net.dpt_head.scratch.output_conv2.requires_grad_(False)
+        self.refine_net.dpt_head.scratch.refinenet4.resConfUnit1.requires_grad_(False)
         self.hidden_conv = nn.Conv2d(
             2 * self.iter_dim, self.iter_dim, 1, 1, 0, bias=True
         )

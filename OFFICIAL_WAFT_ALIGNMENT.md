@@ -43,7 +43,13 @@ DPT decoder。
 
 随后完整 ViT 和 DPTHead 再从 WAFT checkpoint 严格恢复为光流预训练参数。
 
-## 方案要求的三处适配
+当前默认实验明确是 **DAv2-A2 initialization**。官方仓库没有 GitHub Release，
+DINOv3-A2 与官方推荐 A1 只放在 Google Drive model zoo；当前执行主机无法连接
+Google Drive，因此本次没有伪造这两组 checkpoint 消融。`waft_checkpoint` 可替换
+为其他同构 A2 checkpoint，加载器会继续执行严格 key/shape 校验；A1 因 head
+接口不同应使用单独实现和配置，不能直接冒充 A2 权重载入。
+
+## 方案要求的任务适配
 
 以下部分不是对 WAFT 官方双帧光流任务的机械复制，而是架构方案明确要求的接口：
 
@@ -53,6 +59,10 @@ DPT decoder。
    source-K 替代官方 DINO/DAv2 双图 encoder。
 3. `models/waft.py`：第一次 `hidden_conv` 使用按 Stage-A 位移对齐后的 source
    feature；confidence gate 保留在官方 updater 外部。
+4. source local encoder 在 Phase C 加入，融合卷积按
+   `[identity, zero-local]` 初始化，因此切换阶段时保持 Phase B 函数不变。
+5. 当前接口不复制官方图像 Padder，而是在入口明确要求高宽能被 16 整除；
+   updater 内的 feature warp 已恢复官方 `padding_mode=zeros`。
 
 除此之外，循环输入仍严格包含官方的
 `[target feature, warped source feature, hidden state, current flow]`，不会删掉
@@ -63,3 +73,20 @@ DPT decoder。
 正式训练不预先硬编码某四层。Phase 1 扫描 Qwen MMDiT 全部 60 层、候选去噪步
 以及 pre/post-RoPE 版本，再将探针选出的 top-4 层写入
 `runs/qwen_qk_waft/phase1_probe/selection.json`。DPTHead 固定接收这四层。
+
+探针的 true-match margin 会先屏蔽真实位置，再与最强非匹配位置比较；同时记录
+forward-backward cycle consistency、三随机种子稳定性，以及文字结构、页面边缘、
+四角、内部纹理和空白背景分区结果。这里的“文字结构”来自 target 图像的固定
+边缘/局部纹理规则，不冒充 OCR 标注文字行。
+
+## 训练安全与连续性
+
+- 三个 DPTHead 中永远不经过 intermediate forward 的 `output_conv2`，以及
+  `refinenet4` 无 skip 输入时永远不调用的 `resConfUnit1` 均被冻结；因此正式
+  DDP 保持 `find_unused_parameters=False`。
+- validation 与 inference 和训练共用 BF16 autocast；probability BCE 单独在
+  FP32 中计算。
+- Phase D 的 gate 初始化为 0.99，保持 Phase C residual；错误 prior 区域的
+  correction loss 使用正的 improvement margin。
+- checkpoint 不再只按平均或伪 line EPE 选择，而使用 EPE、P95、文字结构、
+  straightness、边缘、角点、masked fold 和 invalid rate 的配置化联合分数。

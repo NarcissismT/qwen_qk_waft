@@ -40,6 +40,8 @@ class OfficialQKDPT(nn.Module):
             feature_channels,
             out_channels=dpt_out_channels,
         )
+        self.dpt_head.scratch.output_conv2.requires_grad_(False)
+        self.dpt_head.scratch.refinenet4.resConfUnit1.requires_grad_(False)
         self.output_projection = nn.Sequential(
             nn.Conv2d(feature_channels // 2, feature_channels, 3, padding=1),
             nn.GELU(),

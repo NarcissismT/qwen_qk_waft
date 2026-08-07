@@ -29,6 +29,11 @@ def infer(
     model = _build_model(config, selection)
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
+    amp_dtype = (
+        torch.bfloat16
+        if config["train"]["amp_dtype"] == "bfloat16"
+        else torch.float16
+    )
 
     native = load_rgb(image_path).unsqueeze(0).to(device)
     native_size = native.shape[-2:]
@@ -52,15 +57,18 @@ def infer(
             step=int(selection["step"]),
             variant=str(selection["variant"]),
         )
-        output = model(
-            model_input,
-            queries,
-            keys,
-            iterations=int(config["phases"]["d"]["iterations"]),
-            use_local_encoder=True,
-            use_gate=True,
-            render=False,
-        )
+        with torch.autocast(
+            "cuda", dtype=amp_dtype, enabled=bool(config["train"]["amp"])
+        ):
+            output = model(
+                model_input,
+                queries,
+                keys,
+                iterations=int(config["phases"]["d"]["iterations"]),
+                use_local_encoder=True,
+                use_gate=True,
+                render=False,
+            )
 
     native_map = resize_absolute_map(
         output["final_map"],

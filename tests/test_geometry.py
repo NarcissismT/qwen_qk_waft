@@ -6,6 +6,7 @@ from qwen_qk_waft.geometry import (
     pixel_grid,
     resize_absolute_map,
     sample_by_map,
+    sample_feature_at_displacement,
 )
 
 
@@ -35,3 +36,9 @@ def test_absolute_map_resize_scales_source_coordinates() -> None:
     expected = pixel_grid(1, 9, 13, device="cpu", dtype=torch.float32)
     torch.testing.assert_close(resized, expected, atol=1.0e-5, rtol=1.0e-5)
 
+
+def test_waft_feature_warp_uses_official_zero_padding() -> None:
+    feature = torch.ones(1, 2, 4, 4)
+    displacement = torch.full((1, 2, 4, 4), 100.0)
+    sampled = sample_feature_at_displacement(feature, displacement)
+    assert torch.count_nonzero(sampled) == 0

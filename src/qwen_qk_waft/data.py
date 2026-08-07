@@ -85,11 +85,16 @@ class DocumentMapDataset(Dataset[dict[str, Any]]):
             pixel_map = displacement_to_map(flow_or_map)
         elif flow_format in {"absolute_map", "backward_map", "map"}:
             pixel_map = flow_or_map
-        else:
+        elif flow_format in {"normalized_map", "normalized_backward_map"}:
             source_h, source_w = source_size
             pixel_map = flow_or_map.clone()
             pixel_map[:, 0] = (pixel_map[:, 0] + 1) * (source_w - 1) / 2
             pixel_map[:, 1] = (pixel_map[:, 1] + 1) * (source_h - 1) / 2
+        else:
+            raise ValueError(
+                f"unsupported flow_format={flow_format!r} in record "
+                f"{record.get('id', index)!r}"
+            )
         pixel_map = resize_absolute_map(
             pixel_map,
             self.work_size,
@@ -124,4 +129,3 @@ class DocumentMapDataset(Dataset[dict[str, Any]]):
             "map": pixel_map,
             "valid": valid,
         }
-

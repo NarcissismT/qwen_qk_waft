@@ -117,7 +117,8 @@ def sample_feature_at_displacement(feature: Tensor, displacement: Tensor) -> Ten
     current_map = displacement + pixel_grid(
         batch, height, width, device=feature.device, dtype=feature.dtype
     )
-    return sample_by_map(feature, current_map)
+    # Official WAFT feature warping uses grid_sample's default zero padding.
+    return sample_by_map(feature, current_map, padding_mode="zeros")
 
 
 def valid_map_mask(pixel_map: Tensor, source_size: Sequence[int]) -> Tensor:
@@ -132,4 +133,3 @@ def map_jacobian_determinant(pixel_map: Tensor) -> Tensor:
     dx = dx[:, :, :-1]
     dy = dy[:, :, :, :-1]
     return dx[:, 0] * dy[:, 1] - dx[:, 1] * dy[:, 0]
-

@@ -22,10 +22,12 @@ The architecture is split at the same boundaries as the design document:
 | Absolute-map sequence, reconstruction, edge, bending, fold, uncertainty and gate losses | `src/qwen_qk_waft/losses.py` |
 | Native source-faithful one-sample inference | `src/qwen_qk_waft/infer.py` |
 
-The recurrent updater now directly uses the modules and parameter contract of
+The recurrent updater directly uses the modules and parameter contract of
 the official [princeton-vl/WAFT](https://github.com/princeton-vl/WAFT)
 `waftv2` implementation. See `OFFICIAL_WAFT_ALIGNMENT.md` for the source-level
-mapping and the three deliberate task adaptations.
+mapping and the deliberate task adaptations. The accurate model name is
+`Qwen-QK + independent DPT + Stage-A-initialized WAFT-A2 adaptation`; this is
+not the unchanged official two-frame WAFT model.
 
 The complete WAFT DAv2-A2 zero-shot checkpoint is stored at:
 
@@ -40,12 +42,16 @@ ViT, DPTHead or update-head key does not load strictly.
 
 ## Training phases
 
-`scripts/train_slurm.sh` runs the planned phases in order:
+`scripts/train_slurm.sh` first runs fail-closed preflight checks for official
+WAFT loading, Stage-A parity, Qwen LoRA schema, 2-GPU BF16 DDP, and the GT map
+coordinate contract. It then runs the planned phases in order:
 
 1. audit GT backward-map reconstruction;
 2. compare base Qwen and LoRA scales `0.25/0.5/0.75/1.0`, all 60 layers, all
    four probe steps, pre-RoPE, post-RoPE, their concatenation, and hidden-state
-   diagnostics; select the formal top four Q/K layers;
+   diagnostics over three fixed seeds; measure cycle consistency and
+   text-structure/page-edge/corner/interior/background regions; select the
+   formal top four Q/K layers;
 3. calibrate the frozen Stage-A confidence head;
 4. train Q/K adapters, independent DPT-Q/K and WAFT with a `1 -> 3 -> 5`
    iteration curriculum, with Qwen and Stage-A frozen;
@@ -70,6 +76,10 @@ workers with `torchrun`, and writes:
 
 - log: `runs/qwen_qk_waft/train.log`
 - official initialization report: `runs/qwen_qk_waft/official_waft_initialization.json`
+- Stage-A strict-load/parity report: `runs/qwen_qk_waft/stage_a_initialization.json`
+- Qwen LoRA schema report: `runs/qwen_qk_waft/qwen_lora_initialization.json`
+- 2-GPU BF16 DDP report: `runs/qwen_qk_waft/ddp_bfloat16_preflight.json`
+- coordinate audit: `runs/qwen_qk_waft/phase0_audit.json`
 - Q/K selection: `runs/qwen_qk_waft/phase1_probe/selection.json`
 - final checkpoint: `runs/qwen_qk_waft/phase5_confidence_gate/best.pt`
 - completion marker: `runs/qwen_qk_waft/_SUCCESS`
@@ -99,8 +109,10 @@ PYTHONPATH=src /usr/bin/python -m qwen_qk_waft.infer \
 bash scripts/smoke_test.sh
 ```
 
-Unit tests cover identity, translation and resize coordinate contracts,
-runtime Qwen token segmentation, the complete synthetic forward, losses and
-gradient flow.  These tests validate implementation contracts; the formal
-training run and OCR/visual quality still require the Slurm receipts and
-result review.
+Unit tests cover coordinate contracts, official zero-padding, runtime Qwen
+token segmentation, complete forward/loss/gradient flow, Phase-B/C/D function
+continuity, Q/K margin and cycle consistency, official zero-flow A2 equations,
+and expanded evaluation metrics. The current line regions are deterministic
+target-image structure masks because the manifests do not contain annotated
+text-line masks. Formal OCR, annotated-line, and visual-quality acceptance
+still require the Slurm outputs and result review.

@@ -84,6 +84,7 @@ def compute_losses(
     *,
     sequence_gamma: float,
     gate_temperature_px: float,
+    required_improvement_px: float,
     min_jacobian: float,
 ) -> dict[str, Tensor]:
     target_map = batch["map"]
@@ -121,12 +122,21 @@ def compute_losses(
     gates: list[Tensor] = output["gates"]
     if gates:
         gate = F.interpolate(gates[-1], target_map.shape[-2:], mode="bilinear", align_corners=True)
-        gate_loss = masked_mean(F.binary_cross_entropy(gate, gate_target, reduction="none"), valid)
+        with torch.autocast(device_type=gate.device.type, enabled=False):
+            gate_loss = masked_mean(
+                F.binary_cross_entropy(
+                    gate.float(), gate_target.float(), reduction="none"
+                ),
+                valid,
+            )
         correct_prior = valid & (coarse_error < gate_temperature_px)
         wrong_prior = valid & (coarse_error >= gate_temperature_px)
         final_error = endpoint_error(final_map, target_map)
         protection = masked_mean(F.relu(final_error - coarse_error), correct_prior)
-        correction = masked_mean(F.relu(final_error - coarse_error), wrong_prior)
+        correction = masked_mean(
+            F.relu(final_error - coarse_error + required_improvement_px),
+            wrong_prior,
+        )
 
     terms = {
         "sequence": sequence,

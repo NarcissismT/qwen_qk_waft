@@ -5,9 +5,13 @@ set -euo pipefail
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 PROJECT_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd -P)"
 CONFIG="${QKWAFT_CONFIG:-$PROJECT_ROOT/configs/qwen_qk_waft.yaml}"
-CONTAINER_IMAGE="${QKWAFT_CONTAINER_IMAGE:-docker://registry.intsig.net/zhuochu_yang/diffsynth:v2-diffusers}"
+DEFAULT_IMAGE="docker://registry.intsig.net/zhuochu_yang/diffsynth:v2-diffusers"
+CONTAINER_IMAGE="${QKWAFT_CONTAINER_IMAGE:-$DEFAULT_IMAGE}"
 RUN_ROOT="${QKWAFT_RUN_ROOT:-$PROJECT_ROOT/runs/qwen_qk_waft}"
 PHASES="${QKWAFT_PHASES:-audit,probe,confidence,b,c,d}"
+RUNTIME_PREFLIGHT="${QKWAFT_RUNTIME_PREFLIGHT:-1}"
+CONTAINER_ENV="QKWAFT_CONFIG,QKWAFT_RUN_ROOT,QKWAFT_PHASES"
+CONTAINER_ENV+=",QKWAFT_RUNTIME_PREFLIGHT,HF_HOME"
 
 if [[ "${1:-}" != "--inside" ]]; then
     if ! command -v srun >/dev/null 2>&1; then
@@ -17,6 +21,7 @@ if [[ "${1:-}" != "--inside" ]]; then
     export QKWAFT_CONFIG="$CONFIG"
     export QKWAFT_RUN_ROOT="$RUN_ROOT"
     export QKWAFT_PHASES="$PHASES"
+    export QKWAFT_RUNTIME_PREFLIGHT="$RUNTIME_PREFLIGHT"
     export HF_HOME="${HF_HOME:-/juicefs-algorithm/data/IPT/yuang_feng/cache}"
     exec srun -K \
         --job-name=qwen-qk-waft \
@@ -29,7 +34,7 @@ if [[ "${1:-}" != "--inside" ]]; then
         --container-image="$CONTAINER_IMAGE" \
         --container-mounts=/juicefs-algorithm:/juicefs-algorithm \
         --container-workdir="$PROJECT_ROOT" \
-        --container-env=QKWAFT_CONFIG,QKWAFT_RUN_ROOT,QKWAFT_PHASES,HF_HOME \
+        --container-env="$CONTAINER_ENV" \
         bash "$SCRIPT_PATH" --inside
 fi
 
@@ -60,18 +65,27 @@ echo "[run] root=$RUN_ROOT phases=$PHASES"
 "$PYTHON" scripts/verify_official_waft.py \
     --config "$CONFIG" \
     --output "$RUN_ROOT/official_waft_initialization.json"
+"$PYTHON" -m qwen_qk_waft.stage_a_audit --config "$CONFIG"
+"$PYTHON" -m qwen_qk_waft.qwen_lora_audit --config "$CONFIG"
+if [[ "$RUNTIME_PREFLIGHT" == "1" ]]; then
+    "${TORCHRUN[@]}" --standalone --nproc_per_node=2 \
+        scripts/ddp_preflight.py --config "$CONFIG"
+fi
 if has_phase audit; then
     "$PYTHON" -m qwen_qk_waft.audit --config "$CONFIG"
 fi
 if has_phase probe; then
-    "${TORCHRUN[@]}" --standalone --nproc_per_node=8 -m qwen_qk_waft.probe --config "$CONFIG"
+    "${TORCHRUN[@]}" --standalone --nproc_per_node=8 \
+        -m qwen_qk_waft.probe --config "$CONFIG"
 fi
 if has_phase confidence; then
-    "${TORCHRUN[@]}" --standalone --nproc_per_node=8 -m qwen_qk_waft.train --config "$CONFIG" --phase confidence
+    "${TORCHRUN[@]}" --standalone --nproc_per_node=8 \
+        -m qwen_qk_waft.train --config "$CONFIG" --phase confidence
 fi
 for phase in b c d; do
     if has_phase "$phase"; then
-        "${TORCHRUN[@]}" --standalone --nproc_per_node=8 -m qwen_qk_waft.train --config "$CONFIG" --phase "$phase"
+        "${TORCHRUN[@]}" --standalone --nproc_per_node=8 \
+            -m qwen_qk_waft.train --config "$CONFIG" --phase "$phase"
     fi
 done
 

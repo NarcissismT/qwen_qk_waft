@@ -85,6 +85,17 @@ class QwenQKWAFT(nn.Module):
         self.source_fusion = nn.Conv2d(
             2 * feature_channels, feature_channels, 1
         )
+        self.initialize_source_fusion_as_bypass()
+
+    def initialize_source_fusion_as_bypass(self) -> None:
+        """Start Phase C as the exact Phase-B diffusion-source function."""
+
+        channels = self.source_fusion.out_channels
+        with torch.no_grad():
+            self.source_fusion.weight.zero_()
+            self.source_fusion.bias.zero_()
+            index = torch.arange(channels)
+            self.source_fusion.weight[index, index, 0, 0] = 1.0
 
     def load_waft_pretrained(
         self, checkpoint_path: str | Path
@@ -108,6 +119,10 @@ class QwenQKWAFT(nn.Module):
         render: bool = True,
     ) -> dict[str, Tensor | list[Tensor]]:
         _, _, height, width = warped.shape
+        if height % 16 or width % 16:
+            raise ValueError(
+                "WAFT patch-8 refinement requires image height and width divisible by 16"
+            )
         half_size = (height // 2, width // 2)
         with torch.no_grad():
             stage_a = self.stage_a(warped)
