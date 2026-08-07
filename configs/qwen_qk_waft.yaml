@@ -1,0 +1,114 @@
+seed: 20260807
+
+data:
+  train_manifest: ../diffusion2raft_unified_v3_1/data/train.jsonl
+  val_manifest: ../diffusion2raft_unified_v3_1/data/val.jsonl
+  work_size: [512, 512]
+  batch_size_per_gpu: 1
+  num_workers: 2
+
+qwen:
+  model_root: /juicefs-algorithm/data/IPT/yuang_feng/DiffSynth-Studio/models/Qwen-Image-Edit
+  pipeline_class: QwenImageEditPipeline
+  lora_checkpoint: /juicefs-algorithm/data/IPT/yuang_feng/DiffSynth-Studio/result/20250929-1_1in10_w_unwarp/step-668000.safetensors
+  lora_scale: 1.0
+  dtype: bfloat16
+  local_files_only: true
+  cpu_offload: false
+  height: 512
+  width: 512
+  num_inference_steps: 4
+  true_cfg_scale: 1.0
+  guidance_scale: 1.0
+  seed: 0
+  prompt: >-
+    Rectify the warped photographed document into a flat front-facing page on
+    the same canvas. Preserve every character, line, illustration, and margin.
+    Do not add, remove, rewrite, translate, sharpen, or restyle any content.
+    Change geometry only.
+
+model:
+  stage_a_checkpoint: ../diffusion2raft_unified_v3_1/runs/d2r_v3_1/unified/best.pt
+  stage_a_base_channels: 32
+  stage_a_max_displacement_ratio: 0.35
+  stage_a_control_stride: 8
+  waft_model_name: vits
+  waft_patch_size: 8
+  timm_checkpoint: /juicefs-algorithm/data/IPT/zhuochu_yang/DiffSynth-Studio/models/WAFT/vit_small_patch16_224_imagenet.safetensors
+  waft_checkpoint: /juicefs-algorithm/data/IPT/zhuochu_yang/DiffSynth-Studio/models/WAFT/waft_dav2_a2_zero_shot.ckpt
+
+audit:
+  samples: 64
+  report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase0_audit.json
+
+probe:
+  samples: 32
+  target_points: 64
+  lora_scales: [0.0, 0.25, 0.5, 0.75, 1.0]
+  layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
+  steps: [0, 1, 2, 3]
+  top_layers: 4
+  output_dir: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase1_probe
+
+phases:
+  confidence:
+    epochs: 2
+    learning_rate: 0.0001
+    weight_decay: 0.00001
+    temperature_px: 3.0
+    max_train_samples: null
+    checkpoint: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase2_confidence/stage_a_confidence.pt
+  b:
+    epochs: 6
+    iteration_schedule: [1, 1, 3, 3, 5, 5]
+    iterations: 5
+    local_encoder: false
+    gate: false
+    learning_rate: 0.0004
+    weight_decay: 0.00001
+    max_train_samples: null
+    resume: null
+    output_dir: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase3_qk_dpt_waft
+  c:
+    epochs: 2
+    iterations: 5
+    local_encoder: true
+    gate: false
+    learning_rate: 0.0001
+    weight_decay: 0.00001
+    max_train_samples: null
+    resume: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase3_qk_dpt_waft/best.pt
+    output_dir: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase4_local_encoder
+  d:
+    epochs: 2
+    iterations: 5
+    local_encoder: true
+    gate: true
+    learning_rate: 0.00005
+    weight_decay: 0.00001
+    max_train_samples: null
+    resume: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase4_local_encoder/best.pt
+    output_dir: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase5_confidence_gate
+
+train:
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip: 1.0
+  log_every: 20
+  val_samples: 64
+
+loss:
+  sequence_gamma: 0.85
+  gate_temperature_px: 3.0
+  min_jacobian: 0.05
+  weights:
+    sequence: 1.0
+    uncertainty: 0.05
+    edge: 0.15
+    reconstruction: 0.15
+    line: 0.1
+    bending: 0.002
+    anti_fold: 0.2
+    gate: 0.05
+    protection: 0.1
+    correction: 0.1

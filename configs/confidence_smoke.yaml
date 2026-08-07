@@ -1,0 +1,21 @@
+seed: 20260807
+data:
+  train_manifest: ../diffusion2raft_unified_v3_1/data/train.jsonl
+  work_size: [128, 128]
+  num_workers: 0
+model:
+  stage_a_checkpoint: ../diffusion2raft_unified_v3_1/runs/d2r_v3_1/unified/best.pt
+  stage_a_base_channels: 32
+  stage_a_max_displacement_ratio: 0.35
+  stage_a_control_stride: 8
+phases:
+  confidence:
+    epochs: 1
+    learning_rate: 0.0001
+    weight_decay: 0.00001
+    temperature_px: 3.0
+    max_train_samples: 8
+    checkpoint: runs/confidence_smoke/stage_a_confidence.pt
+train:
+  log_every: 1
+
