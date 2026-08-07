@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from .config import load_config, resolve_path
 from .data import DocumentMapDataset, tensor_to_pil
-from .geometry import map_jacobian_determinant, valid_map_mask
+from .geometry import map_jacobian_determinant, sample_by_map, valid_map_mask
 from .losses import (
     compute_losses,
     confidence_loss,
@@ -33,6 +33,7 @@ from .metrics import (
     masked_quantile,
     reconstruction_psnr,
     reconstruction_ssim,
+    text_line_fit_residual,
 )
 from .models.model import QwenQKWAFT
 from .models.qwen_qk import QwenQKExtractor
@@ -239,6 +240,7 @@ def _evaluate(
     amp_dtype: torch.dtype,
     gate_temperature_px: float,
     selection_weights: Mapping[str, float],
+    geometry_criteria: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, Tensor] = {}
@@ -275,6 +277,12 @@ def _evaluate(
         final_error = endpoint_error(final_map, target_map)
         prior_error = endpoint_error(coarse_map, target_map)
         regions = document_region_masks(batch["target"], valid)
+        line_available = batch.get("line_mask_available")
+        has_annotated_lines = bool(
+            line_available is not None and line_available.bool().all()
+        )
+        if has_annotated_lines:
+            regions["line"] = valid & batch["line_mask"].bool()
 
         add("epe", masked_mean(final_error, valid))
         add("epe_p95", masked_quantile(final_error, valid, 0.95))
@@ -298,20 +306,53 @@ def _evaluate(
         add("residual_epe", masked_mean(residual_error, valid))
 
         determinant = map_jacobian_determinant(final_map)
+        prior_determinant = map_jacobian_determinant(coarse_map)
         fold_valid = valid[:, :, :-1, :-1]
         add("fold_rate", masked_mean((determinant <= 0).float().unsqueeze(1), fold_valid))
+        add(
+            "prior_fold_rate",
+            masked_mean((prior_determinant <= 0).float().unsqueeze(1), fold_valid),
+        )
         jacobian_minimum = torch.minimum(
             jacobian_minimum,
             masked_minimum(determinant.unsqueeze(1), fold_valid).float(),
         )
         predicted_valid = valid_map_mask(final_map, batch["warped"].shape[-2:])
+        prior_predicted_valid = valid_map_mask(
+            coarse_map, batch["warped"].shape[-2:]
+        )
         add("invalid_rate", masked_mean((~predicted_valid).float(), valid))
+        add("prior_invalid_rate", masked_mean((~prior_predicted_valid).float(), valid))
 
         rectified = output["rectified"].float()
         target_image = batch["target"].float()
         add("reconstruction_l1", masked_mean((rectified - target_image).abs(), valid))
         add("reconstruction_psnr", reconstruction_psnr(rectified, target_image, valid))
         add("reconstruction_ssim", reconstruction_ssim(rectified, target_image, valid))
+
+        line_instances_available = batch.get("line_instances_available")
+        has_line_instances = bool(
+            line_instances_available is not None
+            and line_instances_available.bool().all()
+        )
+        add(
+            "annotated_line_samples",
+            final_error.new_tensor(float(has_line_instances)),
+        )
+        if has_line_instances:
+            prior_rectified = sample_by_map(batch["warped"], coarse_map)
+            add(
+                "annotated_line_fit_residual",
+                text_line_fit_residual(
+                    rectified, batch["line_instances"], valid
+                ),
+            )
+            add(
+                "prior_annotated_line_fit_residual",
+                text_line_fit_residual(
+                    prior_rectified, batch["line_instances"], valid
+                ),
+            )
 
         confidence_target = torch.exp(-prior_error / gate_temperature_px)
         confidence = output["coarse_confidence"].float()
@@ -322,17 +363,35 @@ def _evaluate(
         add("confidence_ece", confidence_ece)
         add("high_confidence_epe", masked_mean(final_error, valid & (confidence >= 0.5)))
         add("low_confidence_epe", masked_mean(final_error, valid & (confidence < 0.5)))
-
-        gate = F.interpolate(
-            output["gates"][-1].float(),
-            target_map.shape[-2:],
-            mode="bilinear",
-            align_corners=True,
+        high_confidence = valid & (confidence >= 0.5)
+        damage_margin = float(
+            (geometry_criteria or {}).get("high_confidence_damage_margin_px", 0.5)
         )
+        add(
+            "high_confidence_damage_rate",
+            masked_mean(
+                (final_error > prior_error + damage_margin).float(), high_confidence
+            ),
+        )
+
         gate_target = (prior_error / gate_temperature_px).clamp(0, 1)
-        gate_brier, gate_ece = calibration_metrics(gate, gate_target, valid)
-        add("gate_brier", gate_brier)
-        add("gate_ece", gate_ece)
+        for gate_index, iteration_gate in enumerate(output["gates"], 1):
+            gate = F.interpolate(
+                iteration_gate.float(),
+                target_map.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
+            )
+            gate_brier, gate_ece = calibration_metrics(gate, gate_target, valid)
+            add(f"iteration_{gate_index}_gate_brier", gate_brier)
+            add(f"iteration_{gate_index}_gate_ece", gate_ece)
+            for bin_index, value in enumerate(gate_histogram(gate, valid)):
+                add(
+                    f"iteration_{gate_index}_gate_histogram_{bin_index}", value
+                )
+        gate_brier = calibration_metrics(gate, gate_target, valid)
+        add("gate_brier", gate_brier[0])
+        add("gate_ece", gate_brier[1])
         for index, value in enumerate(gate_histogram(gate, valid)):
             add(f"gate_histogram_{index}", value)
 
@@ -355,6 +414,17 @@ def _evaluate(
         dist.all_reduce(jacobian_minimum, op=dist.ReduceOp.MIN)
     count = totals.pop("samples").clamp_min(1)
     result = {name: float(value / count) for name, value in totals.items()}
+    annotated_fraction = result.pop("annotated_line_samples", 0.0)
+    result["line_annotation_fraction"] = annotated_fraction
+    for name in (
+        "annotated_line_fit_residual",
+        "prior_annotated_line_fit_residual",
+    ):
+        result[name] = (
+            result.get(name, 0.0) / annotated_fraction
+            if annotated_fraction > 0
+            else 0.0
+        )
     result["jacobian_min"] = float(jacobian_minimum)
     result["epe_gain"] = result["prior_epe"] - result["epe"]
     result["line_epe_gain"] = result["prior_line_epe"] - result["line_epe"]
@@ -362,14 +432,37 @@ def _evaluate(
         result["prior_line_straightness_error"]
         - result["line_straightness_error"]
     )
+    result["annotated_line_fit_gain"] = (
+        result["prior_annotated_line_fit_residual"]
+        - result["annotated_line_fit_residual"]
+    )
+    result["line_geometry_gain"] = (
+        result["annotated_line_fit_gain"]
+        if annotated_fraction > 0
+        else result["line_straightness_gain"]
+    )
+    result["line_geometry_uses_annotations"] = float(annotated_fraction > 0)
     result["selection_score"] = sum(
         float(weight) * result[name] for name, weight in selection_weights.items()
     )
+    criteria = dict(geometry_criteria or {})
+    result["fold_rate_increase"] = result["fold_rate"] - result["prior_fold_rate"]
+    result["invalid_rate_increase"] = (
+        result["invalid_rate"] - result["prior_invalid_rate"]
+    )
     result["meets_minimum_geometry_criteria"] = float(
-        result["epe_gain"] > 0
-        and result["final_win_rate"] > 0.5
-        and result["line_epe_gain"] > 0
-        and result["line_straightness_gain"] > 0
+        result["epe_gain"] > float(criteria.get("min_epe_gain_px", 0.0))
+        and result["final_win_rate"]
+        > float(criteria.get("min_final_win_rate", 0.5))
+        and result["line_epe_gain"] > float(criteria.get("min_line_epe_gain_px", 0.0))
+        and result["line_geometry_gain"]
+        > float(criteria.get("min_line_straightness_gain", 0.0))
+        and result["fold_rate_increase"]
+        <= float(criteria.get("max_fold_rate_increase", 0.0))
+        and result["invalid_rate_increase"]
+        <= float(criteria.get("max_invalid_rate_increase", 0.0))
+        and result["high_confidence_damage_rate"]
+        <= float(criteria.get("max_high_confidence_damage_rate", 0.05))
     )
     return result
 
@@ -432,6 +525,7 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
     output_dir = resolve_path(config, phase["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     best_value = float("inf")
+    best_saved = False
     with QwenQKExtractor(
         qwen_config,
         device=device,
@@ -508,6 +602,7 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                 amp_dtype=amp_dtype,
                 gate_temperature_px=float(config["loss"]["gate_temperature_px"]),
                 selection_weights=config["train"]["selection_weights"],
+                geometry_criteria=config["train"].get("geometry_criteria", {}),
             )
             if rank == 0:
                 payload = {
@@ -525,12 +620,25 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                 }
                 _save(output_dir / "latest.pt", payload)
                 _save(output_dir / f"epoch_{epoch:04d}.pt", payload)
-                if metrics["selection_score"] < best_value:
+                if (
+                    metrics["meets_minimum_geometry_criteria"] > 0
+                    and metrics["selection_score"] < best_value
+                ):
                     best_value = metrics["selection_score"]
+                    best_saved = True
                     _save(output_dir / "best.pt", payload)
                 print(json.dumps({"phase": phase_name, "epoch": epoch, **metrics}))
+    best_flag = torch.tensor(
+        int(best_saved) if rank == 0 else 0, device=device, dtype=torch.int32
+    )
     if world > 1:
+        dist.broadcast(best_flag, src=0)
         dist.destroy_process_group()
+    if not bool(best_flag.item()):
+        raise RuntimeError(
+            f"Phase {phase_name} produced no checkpoint that satisfies "
+            "train.geometry_criteria; inspect latest.pt metrics"
+        )
 
 
 def main() -> None:

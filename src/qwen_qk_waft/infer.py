@@ -71,7 +71,7 @@ def infer(
             )
 
     native_map = resize_absolute_map(
-        output["final_map"],
+        output["final_map"].float(),
         native_size,
         source_size_from=work_size,
         source_size_to=native_size,

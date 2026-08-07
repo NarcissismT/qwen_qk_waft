@@ -124,8 +124,10 @@ class QwenQKWAFT(nn.Module):
                 "WAFT patch-8 refinement requires image height and width divisible by 16"
             )
         half_size = (height // 2, width // 2)
-        with torch.no_grad():
-            stage_a = self.stage_a(warped)
+        with torch.no_grad(), torch.autocast(
+            device_type=warped.device.type, enabled=False
+        ):
+            stage_a = self.stage_a(warped.float())
         target_feature = self.dpt_q(target_queries, half_size)
         diffusion_source = self.dpt_k(source_keys, half_size)
         if use_local_encoder:
@@ -143,12 +145,13 @@ class QwenQKWAFT(nn.Module):
             source_size_to=half_size,
         )
         initial_displacement = map_to_displacement(coarse_half_map)
-        coarse_confidence = F.interpolate(
-            stage_a["confidence"],
-            half_size,
-            mode="bilinear",
-            align_corners=True,
-        )
+        with torch.autocast(device_type=warped.device.type, enabled=False):
+            coarse_confidence = F.interpolate(
+                stage_a["confidence"].float(),
+                half_size,
+                mode="bilinear",
+                align_corners=True,
+            )
         refined = self.waft(
             target_feature,
             source_feature,

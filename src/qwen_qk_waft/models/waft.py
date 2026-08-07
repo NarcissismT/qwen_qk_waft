@@ -120,21 +120,25 @@ class WAFTRefiner(nn.Module):
 
     @staticmethod
     def upsample_data(flow: Tensor, info: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        batch, channels, height, width = info.shape
-        mask = mask.view(batch, 1, 9, 2, 2, height, width)
-        mask = torch.softmax(mask, dim=2)
-        up_flow = F.unfold(2 * flow, [3, 3], padding=1)
-        up_flow = up_flow.view(batch, 2, 9, 1, 1, height, width)
-        up_info = F.unfold(info, [3, 3], padding=1)
-        up_info = up_info.view(batch, channels, 9, 1, 1, height, width)
-        up_flow = torch.sum(mask * up_flow, dim=2)
-        up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
-        up_info = torch.sum(mask * up_info, dim=2)
-        up_info = up_info.permute(0, 1, 4, 2, 5, 3)
-        return (
-            up_flow.reshape(batch, 2, 2 * height, 2 * width),
-            up_info.reshape(batch, channels, 2 * height, 2 * width),
-        )
+        with torch.autocast(device_type=flow.device.type, enabled=False):
+            flow = flow.float()
+            info = info.float()
+            mask = mask.float()
+            batch, channels, height, width = info.shape
+            mask = mask.view(batch, 1, 9, 2, 2, height, width)
+            mask = torch.softmax(mask, dim=2)
+            up_flow = F.unfold(2 * flow, [3, 3], padding=1)
+            up_flow = up_flow.view(batch, 2, 9, 1, 1, height, width)
+            up_info = F.unfold(info, [3, 3], padding=1)
+            up_info = up_info.view(batch, channels, 9, 1, 1, height, width)
+            up_flow = torch.sum(mask * up_flow, dim=2)
+            up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
+            up_info = torch.sum(mask * up_info, dim=2)
+            up_info = up_info.permute(0, 1, 4, 2, 5, 3)
+            return (
+                up_flow.reshape(batch, 2, 2 * height, 2 * width),
+                up_info.reshape(batch, channels, 2 * height, 2 * width),
+            )
 
     def forward(
         self,
@@ -146,7 +150,8 @@ class WAFTRefiner(nn.Module):
         iterations: int,
         use_gate: bool,
     ) -> dict[str, list[Tensor] | Tensor]:
-        displacement = initial_displacement
+        displacement = initial_displacement.float()
+        coarse_confidence = coarse_confidence.float()
         aligned_source = sample_feature_at_displacement(source_feature, displacement)
         net = self.hidden_conv(torch.cat((target_feature, aligned_source), dim=1))
         displacements: list[Tensor] = []
@@ -154,7 +159,7 @@ class WAFTRefiner(nn.Module):
         gates: list[Tensor] = []
 
         for _ in range(iterations):
-            displacement = displacement.detach()
+            displacement = displacement.detach().float()
             aligned_source = sample_feature_at_displacement(source_feature, displacement)
             refine_input = self.warp_linear(
                 torch.cat(
@@ -167,18 +172,19 @@ class WAFTRefiner(nn.Module):
                 torch.cat((refine_outputs["out"], net), dim=1)
             )
             flow_update = self.flow_head(net)
-            residual, info = flow_update[:, :2], flow_update[:, 2:]
+            residual, info = flow_update[:, :2].float(), flow_update[:, 2:].float()
             if use_gate:
                 gate = self.gate(
                     net,
                     coarse_confidence,
                     target_feature - aligned_source,
                     info,
-                )
+                ).float()
             else:
                 gate = torch.ones_like(coarse_confidence)
-            displacement = displacement + gate * residual
-            mask = 0.25 * self.upsample_weight(net)
+            with torch.autocast(device_type=displacement.device.type, enabled=False):
+                displacement = displacement + gate * residual
+            mask = (0.25 * self.upsample_weight(net)).float()
             full_displacement, full_info = self.upsample_data(
                 displacement, info, mask
             )

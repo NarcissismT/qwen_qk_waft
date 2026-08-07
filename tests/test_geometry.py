@@ -2,6 +2,7 @@ import torch
 
 from qwen_qk_waft.geometry import (
     displacement_to_map,
+    map_jacobian_determinant,
     map_to_displacement,
     pixel_grid,
     resize_absolute_map,
@@ -42,3 +43,15 @@ def test_waft_feature_warp_uses_official_zero_padding() -> None:
     displacement = torch.full((1, 2, 4, 4), 100.0)
     sampled = sample_feature_at_displacement(feature, displacement)
     assert torch.count_nonzero(sampled) == 0
+
+
+def test_bfloat16_autocast_keeps_512_identity_coordinates_in_float32() -> None:
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        identity = pixel_grid(1, 512, 512, device="cpu", dtype=torch.bfloat16)
+        determinant = map_jacobian_determinant(identity)
+    assert identity.dtype == torch.float32
+    assert determinant.dtype == torch.float32
+    assert torch.unique(identity[0, 0, 0]).numel() == 512
+    assert torch.unique(identity[0, 1, :, 0]).numel() == 512
+    assert torch.count_nonzero(determinant <= 0) == 0
+    torch.testing.assert_close(determinant, torch.ones_like(determinant))

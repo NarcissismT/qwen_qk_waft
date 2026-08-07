@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from qwen_qk_waft.config import load_config, resolve_path
-from qwen_qk_waft.geometry import pixel_grid
+from qwen_qk_waft.geometry import map_jacobian_determinant, pixel_grid
 from qwen_qk_waft.losses import compute_losses
 from qwen_qk_waft.models.model import QwenQKWAFT
 from qwen_qk_waft.train import _evaluate, _phase_trainability
@@ -52,18 +52,18 @@ def main() -> None:
     amp_dtype = torch.bfloat16
     for step in range(2):
         generator = torch.Generator(device=device).manual_seed(1000 + rank + step)
-        warped = torch.rand(1, 3, 64, 64, generator=generator, device=device)
+        warped = torch.rand(1, 3, 512, 512, generator=generator, device=device)
         target_q = torch.rand(
-            1, 4, 32, 4, 4, generator=generator, device=device, dtype=amp_dtype
+            1, 4, 32, 32, 32, generator=generator, device=device, dtype=amp_dtype
         )
         source_k = torch.rand(
-            1, 4, 32, 4, 4, generator=generator, device=device, dtype=amp_dtype
+            1, 4, 32, 32, 32, generator=generator, device=device, dtype=amp_dtype
         )
-        target_map = pixel_grid(1, 64, 64, device=device, dtype=torch.float32)
+        target_map = pixel_grid(1, 512, 512, device=device, dtype=torch.float32)
         batch = {
             "warped": warped,
             "map": target_map,
-            "valid": torch.ones(1, 1, 64, 64, device=device, dtype=torch.bool),
+            "valid": torch.ones(1, 1, 512, 512, device=device, dtype=torch.bool),
             "target": warped,
         }
         with torch.autocast("cuda", dtype=amp_dtype):
@@ -85,6 +85,10 @@ def main() -> None:
                     config["loss"]["required_improvement_px"]
                 ),
                 min_jacobian=float(config["loss"]["min_jacobian"]),
+            )
+        if output["final_map"].dtype != torch.float32:
+            raise RuntimeError(
+                f"coordinate map must remain float32, got {output['final_map'].dtype}"
             )
         optimizer.zero_grad(set_to_none=True)
         losses["total"].backward()
@@ -112,6 +116,11 @@ def main() -> None:
             "steps": 2,
             "dtype": "bfloat16",
             "find_unused_parameters": False,
+            "canvas": [512, 512],
+            "coordinate_dtype": str(output["final_map"].dtype).removeprefix("torch."),
+            "identity_fold_rate": float(
+                (map_jacobian_determinant(target_map) <= 0).float().mean()
+            ),
             "loss": float(losses["total"].detach()),
             "validation_selection_score": metrics["selection_score"],
             "passed": True,

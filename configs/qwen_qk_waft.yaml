@@ -11,6 +11,8 @@ qwen:
   model_root: /juicefs-algorithm/data/IPT/yuang_feng/DiffSynth-Studio/models/Qwen-Image-Edit
   pipeline_class: QwenImageEditPipeline
   lora_checkpoint: /juicefs-algorithm/data/IPT/yuang_feng/DiffSynth-Studio/result/20250929-1_1in10_w_unwarp/step-668000.safetensors
+  lora_training_script: ../scripts/f-20250929-1-train.sh
+  lora_reference_loader_alpha: 1.0
   lora_scale: 1.0
   dtype: bfloat16
   local_files_only: true
@@ -44,6 +46,11 @@ audit:
   max_stage_a_parity_error: 0.00001
   stage_a_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/stage_a_initialization.json
   ddp_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/ddp_bfloat16_preflight.json
+  coordinate_precision_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/coordinate_precision.json
+  full_model_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/full_model_preflight.json
+  full_model_layers: [0, 15, 30, 45]
+  max_qk_projection_parity_error: 0.000001
+  native_test_sizes: [2048, 4096]
   lora_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/qwen_lora_initialization.json
   max_gt_warp_l1: 0.01
   min_gt_warp_psnr: 35.0
@@ -123,6 +130,15 @@ train:
     corner_epe: 0.05
     fold_rate: 10.0
     invalid_rate: 2.0
+  geometry_criteria:
+    min_epe_gain_px: 0.0
+    min_final_win_rate: 0.5
+    min_line_epe_gain_px: 0.0
+    min_line_straightness_gain: 0.0
+    max_fold_rate_increase: 0.0
+    max_invalid_rate_increase: 0.0
+    high_confidence_damage_margin_px: 0.5
+    max_high_confidence_damage_rate: 0.05
 
 loss:
   sequence_gamma: 0.85

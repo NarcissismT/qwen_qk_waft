@@ -63,6 +63,41 @@ def map_curvature_error(
     )
 
 
+def text_line_fit_residual(
+    image: Tensor,
+    line_instances: Tensor,
+    valid: Tensor,
+) -> Tensor:
+    """RMS residual after fitting an affine baseline to each annotated line."""
+
+    image = image.float()
+    gray = image.mean(dim=1)
+    ink = (1.0 - gray).clamp(0, 1)
+    residuals: list[Tensor] = []
+    for batch_index in range(image.shape[0]):
+        labels = line_instances[batch_index, 0]
+        valid_image = valid[batch_index, 0]
+        for label in torch.unique(labels):
+            if int(label) <= 0:
+                continue
+            mask = (labels == label) & valid_image
+            column_weight = (ink[batch_index] * mask).sum(dim=0)
+            selected = column_weight > 1.0e-4
+            if int(selected.sum()) < 3:
+                continue
+            y = torch.arange(
+                image.shape[-2], device=image.device, dtype=torch.float32
+            ).view(-1, 1)
+            centroid = (ink[batch_index] * mask * y).sum(dim=0)
+            centroid = centroid[selected] / column_weight[selected]
+            x = torch.nonzero(selected).flatten().float()
+            design = torch.stack((x, torch.ones_like(x)), dim=1)
+            solution = torch.linalg.lstsq(design, centroid[:, None]).solution[:, 0]
+            fitted = design @ solution
+            residuals.append(torch.sqrt((centroid - fitted).square().mean()))
+    return torch.stack(residuals).mean() if residuals else image.new_zeros(())
+
+
 def calibration_metrics(
     probability: Tensor,
     target: Tensor,

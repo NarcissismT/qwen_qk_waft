@@ -132,27 +132,37 @@ class StageA(nn.Module):
         return torch.stack((x, y), dim=0).unsqueeze(0).expand(batch, -1, -1, -1)
 
     def forward(self, warped: Tensor) -> dict[str, Tensor]:
-        _, _, height, width = warped.shape
-        e0 = self.stem(torch.cat((warped, self._coordinate_channels(warped)), dim=1))
-        e1 = self.down1(e0)
-        e2 = self.down2(e1)
-        e3 = self.bottleneck(self.down3(e2))
-        decoded = self.up0(self.up1(self.up2(e3, e2), e1), e0)
-        raw = self.head(decoded)
-        if self.control_stride > 1:
-            coarse_size = (
-                max(2, (height + self.control_stride - 1) // self.control_stride),
-                max(2, (width + self.control_stride - 1) // self.control_stride),
+        # Stage-A is frozen during WAFT training and remains FP32 even when the
+        # caller wraps the feature network in BF16 autocast.
+        with torch.autocast(device_type=warped.device.type, enabled=False):
+            warped = warped.float()
+            _, _, height, width = warped.shape
+            e0 = self.stem(
+                torch.cat((warped, self._coordinate_channels(warped)), dim=1)
             )
-            raw = F.adaptive_avg_pool2d(raw, coarse_size)
-            raw = F.interpolate(
-                raw, size=(height, width), mode="bicubic", align_corners=True
+            e1 = self.down1(e0)
+            e2 = self.down2(e1)
+            e3 = self.bottleneck(self.down3(e2))
+            decoded = self.up0(self.up1(self.up2(e3, e2), e1), e0)
+            raw = self.head(decoded)
+            if self.control_stride > 1:
+                coarse_size = (
+                    max(2, (height + self.control_stride - 1) // self.control_stride),
+                    max(2, (width + self.control_stride - 1) // self.control_stride),
+                )
+                raw = F.adaptive_avg_pool2d(raw, coarse_size)
+                raw = F.interpolate(
+                    raw, size=(height, width), mode="bicubic", align_corners=True
+                )
+            scale = raw.new_tensor((width, height)).view(1, 2, 1, 1)
+            displacement = (
+                torch.tanh(raw).float() * scale * self.max_displacement_ratio
             )
-        scale = raw.new_tensor((width, height)).view(1, 2, 1, 1)
-        displacement = torch.tanh(raw) * scale * self.max_displacement_ratio
-        confidence = torch.sigmoid(
-            self.confidence_head(torch.cat((decoded, displacement / scale), dim=1))
-        )
+            confidence = torch.sigmoid(
+                self.confidence_head(
+                    torch.cat((decoded, displacement / scale), dim=1)
+                )
+            ).float()
         return {
             "displacement": displacement,
             "map": displacement_to_map(displacement),

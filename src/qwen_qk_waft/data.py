@@ -73,6 +73,22 @@ class DocumentMapDataset(Dataset[dict[str, Any]]):
         path = Path(value)
         return path if path.is_absolute() else self.root / path
 
+    def _optional_mask(
+        self, record: dict[str, Any], name: str, *, integer: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        path = record.get(name)
+        if not path:
+            dtype = torch.int64 if integer else torch.bool
+            return torch.zeros((1, *self.work_size), dtype=dtype), torch.tensor(False)
+        array = _load_array(self._path(path), name)
+        if array.ndim == 2:
+            array = array[None]
+        tensor = torch.from_numpy(np.ascontiguousarray(array)).unsqueeze(0).float()
+        tensor = F.interpolate(tensor, self.work_size, mode="nearest").squeeze(0)
+        if integer:
+            return tensor.round().long(), torch.tensor(True)
+        return tensor > 0.5, torch.tensor(True)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         warped = load_rgb(self._path(record["warped"]))
@@ -122,10 +138,18 @@ class DocumentMapDataset(Dataset[dict[str, Any]]):
             mask_tensor = torch.from_numpy(np.ascontiguousarray(mask)).unsqueeze(0)
             mask_tensor = F.interpolate(mask_tensor, self.work_size, mode="nearest")
             valid &= mask_tensor.squeeze(0) > 0.5
+        line_mask, line_mask_available = self._optional_mask(record, "line_mask")
+        line_instances, line_instances_available = self._optional_mask(
+            record, "line_instances", integer=True
+        )
         return {
             "id": str(record.get("id", index)),
             "warped": warped,
             "target": target,
             "map": pixel_map,
             "valid": valid,
+            "line_mask": line_mask,
+            "line_mask_available": line_mask_available,
+            "line_instances": line_instances,
+            "line_instances_available": line_instances_available,
         }

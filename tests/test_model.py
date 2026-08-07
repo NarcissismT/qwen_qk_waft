@@ -1,8 +1,9 @@
 import torch
 
 from qwen_qk_waft.geometry import pixel_grid, sample_feature_at_displacement
-from qwen_qk_waft.losses import compute_losses
+from qwen_qk_waft.losses import bending_loss, compute_losses
 from qwen_qk_waft.models.model import QwenQKWAFT
+from qwen_qk_waft.metrics import text_line_fit_residual
 from qwen_qk_waft.official_waft import DPTHead, PatchEmbed
 from qwen_qk_waft.train import _evaluate
 
@@ -215,6 +216,63 @@ def endpoint_delta(left: torch.Tensor, right: torch.Tensor) -> float:
     return float(torch.linalg.vector_norm(left - right, dim=1).mean())
 
 
+def test_every_gate_iteration_receives_supervision() -> None:
+    target_map = pixel_grid(1, 8, 8, device="cpu", dtype=torch.float32)
+    first_gate = torch.full((1, 1, 4, 4), 0.4, requires_grad=True)
+    second_gate = torch.full((1, 1, 4, 4), 0.6, requires_grad=True)
+    output = {
+        "maps": [target_map, target_map],
+        "infos": [torch.zeros(1, 4, 8, 8), torch.zeros(1, 4, 8, 8)],
+        "final_map": target_map,
+        "coarse_map": target_map,
+        "coarse_confidence": torch.ones(1, 1, 8, 8),
+        "gates": [first_gate, second_gate],
+        "rectified": torch.zeros(1, 3, 8, 8),
+    }
+    batch = {
+        "map": target_map,
+        "valid": torch.ones(1, 1, 8, 8, dtype=torch.bool),
+        "target": torch.zeros(1, 3, 8, 8),
+    }
+    losses = compute_losses(
+        output,
+        batch,
+        {"gate": 1.0},
+        sequence_gamma=0.85,
+        gate_temperature_px=3.0,
+        required_improvement_px=0.5,
+        min_jacobian=0.05,
+    )
+    losses["total"].backward()
+    assert first_gate.grad is not None and torch.count_nonzero(first_gate.grad)
+    assert second_gate.grad is not None and torch.count_nonzero(second_gate.grad)
+
+
+def test_bending_uses_continuous_flat_region_weights() -> None:
+    pixel_map = pixel_grid(1, 5, 5, device="cpu", dtype=torch.float32)
+    pixel_map[:, 0, :, 2] += 2.0
+    valid = torch.ones(1, 1, 5, 5, dtype=torch.bool)
+    unweighted = bending_loss(pixel_map, valid, torch.ones(1, 1, 5, 5))
+    suppressed = bending_loss(pixel_map, valid, torch.zeros(1, 1, 5, 5))
+    assert unweighted > 0
+    assert suppressed == 0
+
+
+def test_annotated_text_line_metric_fits_a_real_baseline() -> None:
+    straight = torch.ones(1, 3, 16, 16)
+    curved = straight.clone()
+    straight[:, :, 5, :] = 0
+    for x in range(16):
+        y = 4 + round((x - 8) ** 2 / 24)
+        curved[:, :, y, x] = 0
+    instances = torch.ones(1, 1, 16, 16, dtype=torch.long)
+    valid = torch.ones(1, 1, 16, 16, dtype=torch.bool)
+    straight_residual = text_line_fit_residual(straight, instances, valid)
+    curved_residual = text_line_fit_residual(curved, instances, valid)
+    assert straight_residual < 1.0e-5
+    assert curved_residual > 0.5
+
+
 def test_evaluation_reports_geometry_topology_and_calibration_metrics() -> None:
     class Extractor:
         def selected_pair(self, *_args, **_kwargs):
@@ -249,14 +307,22 @@ def test_evaluation_reports_geometry_topology_and_calibration_metrics() -> None:
         "edge_epe",
         "corner_epe",
         "fold_rate",
+        "prior_fold_rate",
         "jacobian_min",
         "invalid_rate",
+        "prior_invalid_rate",
+        "high_confidence_damage_rate",
         "gate_brier",
         "gate_ece",
         "reconstruction_psnr",
         "reconstruction_ssim",
         "iteration_1_epe",
         "iteration_1_update_px",
+        "iteration_1_gate_brier",
+        "iteration_1_gate_ece",
+        "iteration_1_gate_histogram_0",
+        "line_annotation_fraction",
+        "line_geometry_gain",
         "selection_score",
     ):
         assert name in metrics

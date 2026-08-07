@@ -124,7 +124,6 @@ def _load_lora(
     checkpoint: str | Path,
     scale: float,
 ) -> tuple[nn.Module, dict[str, object]]:
-    from peft import LoraConfig, inject_adapter_in_model
     from safetensors.torch import load_file
 
     raw = load_file(str(checkpoint), device="cpu")
@@ -138,24 +137,28 @@ def _load_lora(
     if len(ranks) != 1:
         raise RuntimeError(f"LoRA checkpoint must contain one rank, found {sorted(ranks)}")
     rank = next(iter(ranks))
-    config = LoraConfig(
-        r=rank,
-        lora_alpha=float(rank) * float(scale),
-        target_modules=list(_LORA_TARGETS),
-        bias="none",
-    )
-    transformer = inject_adapter_in_model(config, transformer)
-    adapter_state = {
-        key: value
-        for key, value in transformer.state_dict().items()
-        if ".lora_A." in key or ".lora_B." in key
+    target_names = set(_LORA_TARGETS)
+    modules = {
+        name: module
+        for name, module in transformer.named_modules()
+        if isinstance(module, nn.Linear)
+        and any(name == target or name.endswith(f".{target}") for target in target_names)
     }
-    missing = sorted(set(adapter_state) - set(state))
-    unexpected = sorted(set(state) - set(adapter_state))
+    expected = {
+        f"{name}.lora_{side}.default.weight"
+        for name in modules
+        for side in ("A", "B")
+    }
+    missing = sorted(expected - set(state))
+    unexpected = sorted(set(state) - expected)
     shape_mismatch = sorted(
         key
-        for key in set(adapter_state) & set(state)
-        if adapter_state[key].shape != state[key].shape
+        for name, module in modules.items()
+        for key, expected_shape in (
+            (f"{name}.lora_A.default.weight", (rank, module.in_features)),
+            (f"{name}.lora_B.default.weight", (module.out_features, rank)),
+        )
+        if key in state and tuple(state[key].shape) != expected_shape
     )
     if missing or unexpected or shape_mismatch:
         raise RuntimeError(
@@ -163,23 +166,31 @@ def _load_lora(
             f"missing={missing}, unexpected={unexpected}, "
             f"shape_mismatch={shape_mismatch}"
         )
-    incompatible = transformer.load_state_dict(state, strict=False)
-    unexpected_after_load = sorted(incompatible.unexpected_keys)
-    missing_adapter_after_load = sorted(
-        key for key in incompatible.missing_keys if key in adapter_state
-    )
-    if unexpected_after_load or missing_adapter_after_load:
-        raise RuntimeError(
-            "LoRA load did not cover all adapter parameters: "
-            f"missing={missing_adapter_after_load}, unexpected={unexpected_after_load}"
-        )
+    # Match the original DiffSynth inference loader exactly: it converts A/B
+    # to the base weight dtype and fuses ``scale * (B @ A)`` into each Linear.
+    # The training script omitted lora_alpha, so training used alpha=rank and
+    # its unfused PEFT scale was one at the original scale=1 setting.
+    with torch.no_grad():
+        for name, module in modules.items():
+            a = state[f"{name}.lora_A.default.weight"].to(
+                device=module.weight.device, dtype=module.weight.dtype
+            )
+            b = state[f"{name}.lora_B.default.weight"].to(
+                device=module.weight.device, dtype=module.weight.dtype
+            )
+            module.weight.add_(float(scale) * torch.mm(b, a))
     return transformer, {
         "checkpoint": str(Path(checkpoint).resolve()),
         "scale": float(scale),
         "rank": rank,
         "checkpoint_tensors": len(state),
-        "matched_tensors": len(adapter_state),
-        "coverage": len(adapter_state) / len(state),
+        "matched_tensors": len(expected),
+        "coverage": len(expected) / len(state),
+        "updated_linear_modules": len(modules),
+        "merge_rule": "base_weight + scale * (lora_B @ lora_A)",
+        "training_alpha_over_rank": 1.0,
+        "effective_adapter_scale": float(scale),
+        "matches_original_diffsynth_loader": True,
     }
 
 
@@ -237,12 +248,17 @@ class QwenQKExtractor:
         )
         lora_scale = float(self.config.get("lora_scale", 1.0))
         lora_checkpoint = self.config.get("lora_checkpoint")
+        cpu_offload = bool(self.config.get("cpu_offload", False))
+        if lora_checkpoint and lora_scale > 0:
+            pipeline.transformer.to(self.device)
+        elif not cpu_offload:
+            pipeline.to(self.device)
         if lora_checkpoint and lora_scale > 0:
             pipeline.transformer, self.lora_report = _load_lora(
                 pipeline.transformer, str(lora_checkpoint), lora_scale
             )
             self.lora_report["enabled"] = True
-        if bool(self.config.get("cpu_offload", False)):
+        if cpu_offload:
             pipeline.enable_model_cpu_offload(gpu_id=self.device.index or 0)
         else:
             pipeline.to(self.device)

@@ -21,6 +21,8 @@ The architecture is split at the same boundaries as the design document:
 | Full forward and source-only local branch | `src/qwen_qk_waft/models/model.py` |
 | Absolute-map sequence, reconstruction, edge, bending, fold, uncertainty and gate losses | `src/qwen_qk_waft/losses.py` |
 | Native source-faithful one-sample inference | `src/qwen_qk_waft/infer.py` |
+| FP32 coordinate/Jacobian contract | `src/qwen_qk_waft/geometry.py` |
+| Annotated-line fitting and OCR character-retention evaluation | `src/qwen_qk_waft/metrics.py`, `src/qwen_qk_waft/formal_quality.py` |
 
 The recurrent updater directly uses the modules and parameter contract of
 the official [princeton-vl/WAFT](https://github.com/princeton-vl/WAFT)
@@ -43,8 +45,9 @@ ViT, DPTHead or update-head key does not load strictly.
 ## Training phases
 
 `scripts/train_slurm.sh` first runs fail-closed preflight checks for official
-WAFT loading, Stage-A parity, Qwen LoRA schema, 2-GPU BF16 DDP, and the GT map
-coordinate contract. It then runs the planned phases in order:
+WAFT loading, Stage-A full-model parity, Qwen LoRA scale semantics, 512/2K/4K
+FP32 coordinate behavior, a real Qwen-to-WAFT forward, 2-GPU 512px BF16 DDP,
+and the GT map coordinate contract. It then runs the planned phases in order:
 
 1. audit GT backward-map reconstruction;
 2. compare base Qwen and LoRA scales `0.25/0.5/0.75/1.0`, all 60 layers, all
@@ -57,6 +60,14 @@ coordinate contract. It then runs the planned phases in order:
    iteration curriculum, with Qwen and Stage-A frozen;
 5. enable the source local encoder;
 6. enable and calibrate the confidence-protected residual gate.
+
+All feature convolutions and ViT/DPT blocks may run in BF16. Stage-A map,
+pixel grid, displacement, residual update, normalized sampling grid, convex
+upsampling coordinates, Jacobian and bending/fold losses remain FP32. Each
+gate iteration receives sequence-weighted supervision and has its own
+calibration histogram. `best.pt` is written only when the configured geometry
+criteria improve over Stage-A without increasing fold/invalid rates or
+exceeding the high-confidence damage limit.
 
 The optional Qwen-unfreezing experiment is deliberately not part of the
 default run.  The plan says it is only justified after the frozen descriptor
@@ -78,6 +89,8 @@ workers with `torchrun`, and writes:
 - official initialization report: `runs/qwen_qk_waft/official_waft_initialization.json`
 - Stage-A strict-load/parity report: `runs/qwen_qk_waft/stage_a_initialization.json`
 - Qwen LoRA schema report: `runs/qwen_qk_waft/qwen_lora_initialization.json`
+- 512/2K/4K precision report: `runs/qwen_qk_waft/coordinate_precision.json`
+- real full-model report: `runs/qwen_qk_waft/full_model_preflight.json`
 - 2-GPU BF16 DDP report: `runs/qwen_qk_waft/ddp_bfloat16_preflight.json`
 - coordinate audit: `runs/qwen_qk_waft/phase0_audit.json`
 - Q/K selection: `runs/qwen_qk_waft/phase1_probe/selection.json`
@@ -109,10 +122,25 @@ PYTHONPATH=src /usr/bin/python -m qwen_qk_waft.infer \
 bash scripts/smoke_test.sh
 ```
 
-Unit tests cover coordinate contracts, official zero-padding, runtime Qwen
-token segmentation, complete forward/loss/gradient flow, Phase-B/C/D function
-continuity, Q/K margin and cycle consistency, official zero-flow A2 equations,
-and expanded evaluation metrics. The current line regions are deterministic
-target-image structure masks because the manifests do not contain annotated
-text-line masks. Formal OCR, annotated-line, and visual-quality acceptance
-still require the Slurm outputs and result review.
+Unit tests cover 512px BF16 coordinate uniqueness, zero identity folds,
+official zero-padding, runtime Qwen token segmentation, original DiffSynth
+LoRA `B@A` fusion, complete forward/loss/gradient flow, all-iteration gate
+supervision, weighted bending, Phase-B/C/D continuity, Q/K margin/cycle,
+official zero-flow A2 equations, and expanded metrics.
+
+Validation manifests may provide `line_mask` and integer `line_instances` NPY
+paths. Those switch line EPE from the image-gradient proxy to annotations and
+enable affine text-baseline fitting. OCR output is evaluated offline without
+coupling an OCR model to training. Each JSONL row contains `id`,
+`reference_text`, `prediction_text`, and optionally `stage_a_text`:
+
+```bash
+PYTHONPATH=src /usr/bin/python -m qwen_qk_waft.formal_quality \
+  --input runs/qwen_qk_waft/ocr_results.jsonl \
+  --output runs/qwen_qk_waft/ocr_character_retention.json
+```
+
+When annotations/OCR results are absent, the report names the line metric as a
+development proxy; it is not formal OCR or annotated-line evidence. Formal
+convergence and visual acceptance still require the Slurm run and result
+review.

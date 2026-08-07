@@ -67,7 +67,9 @@ echo "[run] root=$RUN_ROOT phases=$PHASES"
     --output "$RUN_ROOT/official_waft_initialization.json"
 "$PYTHON" -m qwen_qk_waft.stage_a_audit --config "$CONFIG"
 "$PYTHON" -m qwen_qk_waft.qwen_lora_audit --config "$CONFIG"
+"$PYTHON" scripts/coordinate_precision_audit.py --config "$CONFIG"
 if [[ "$RUNTIME_PREFLIGHT" == "1" ]]; then
+    "$PYTHON" scripts/full_model_preflight.py --config "$CONFIG"
     "${TORCHRUN[@]}" --standalone --nproc_per_node=2 \
         scripts/ddp_preflight.py --config "$CONFIG"
 fi

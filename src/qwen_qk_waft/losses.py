@@ -17,6 +17,17 @@ def masked_mean(value: Tensor, valid: Tensor) -> Tensor:
     return (value * mask).sum() / mask.expand_as(value).sum().clamp_min(1)
 
 
+def weighted_masked_mean(value: Tensor, valid: Tensor, weight: Tensor) -> Tensor:
+    mask = valid.to(value.dtype)
+    weight = weight.to(value.dtype)
+    while mask.ndim < value.ndim:
+        mask = mask.unsqueeze(1)
+    while weight.ndim < value.ndim:
+        weight = weight.unsqueeze(1)
+    combined = mask * weight
+    return (value * combined).sum() / combined.expand_as(value).sum().clamp_min(1)
+
+
 def endpoint_error(prediction: Tensor, target: Tensor) -> Tensor:
     return torch.linalg.vector_norm(prediction - target, dim=1, keepdim=True)
 
@@ -53,10 +64,16 @@ def line_reconstruction_loss(
 
 
 def bending_loss(pixel_map: Tensor, valid: Tensor, flat_weight: Tensor) -> Tensor:
+    pixel_map = pixel_map.float()
+    flat_weight = flat_weight.float()
     dxx = pixel_map[:, :, :, 2:] - 2 * pixel_map[:, :, :, 1:-1] + pixel_map[:, :, :, :-2]
     dyy = pixel_map[:, :, 2:, :] - 2 * pixel_map[:, :, 1:-1, :] + pixel_map[:, :, :-2, :]
-    loss_x = masked_mean(dxx.abs(), valid[:, :, :, 1:-1] & (flat_weight[:, :, :, 1:-1] > 0))
-    loss_y = masked_mean(dyy.abs(), valid[:, :, 1:-1, :] & (flat_weight[:, :, 1:-1, :] > 0))
+    loss_x = weighted_masked_mean(
+        dxx.abs(), valid[:, :, :, 1:-1], flat_weight[:, :, :, 1:-1]
+    )
+    loss_y = weighted_masked_mean(
+        dyy.abs(), valid[:, :, 1:-1, :], flat_weight[:, :, 1:-1, :]
+    )
     return loss_x + loss_y
 
 
@@ -121,14 +138,24 @@ def compute_losses(
     correction = target_map.new_zeros(())
     gates: list[Tensor] = output["gates"]
     if gates:
-        gate = F.interpolate(gates[-1], target_map.shape[-2:], mode="bilinear", align_corners=True)
-        with torch.autocast(device_type=gate.device.type, enabled=False):
-            gate_loss = masked_mean(
-                F.binary_cross_entropy(
-                    gate.float(), gate_target.float(), reduction="none"
-                ),
-                valid,
+        gate_weight_sum = 0.0
+        for index, iteration_gate in enumerate(gates):
+            factor = sequence_gamma ** (len(gates) - index - 1)
+            gate = F.interpolate(
+                iteration_gate.float(),
+                target_map.shape[-2:],
+                mode="bilinear",
+                align_corners=True,
             )
+            with torch.autocast(device_type=gate.device.type, enabled=False):
+                gate_loss = gate_loss + factor * masked_mean(
+                    F.binary_cross_entropy(
+                        gate.float(), gate_target.float(), reduction="none"
+                    ),
+                    valid,
+                )
+            gate_weight_sum += factor
+        gate_loss = gate_loss / gate_weight_sum
         correct_prior = valid & (coarse_error < gate_temperature_px)
         wrong_prior = valid & (coarse_error >= gate_temperature_px)
         final_error = endpoint_error(final_map, target_map)

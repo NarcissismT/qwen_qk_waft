@@ -84,9 +84,24 @@ forward-backward cycle consistency、三随机种子稳定性，以及文字结�
 - 三个 DPTHead 中永远不经过 intermediate forward 的 `output_conv2`，以及
   `refinenet4` 无 skip 输入时永远不调用的 `resConfUnit1` 均被冻结；因此正式
   DDP 保持 `find_unused_parameters=False`。
-- validation 与 inference 和训练共用 BF16 autocast；probability BCE 单独在
+- validation 与 inference 和训练共用 BF16 autocast，但 Stage-A map、pixel
+  grid、displacement/residual update、normalized sampling grid、convex
+  upsampling、Jacobian、fold 与 bending 始终使用 FP32；probability BCE 也在
   FP32 中计算。
 - Phase D 的 gate 初始化为 0.99，保持 Phase C residual；错误 prior 区域的
   correction loss 使用正的 improvement margin。
-- checkpoint 不再只按平均或伪 line EPE 选择，而使用 EPE、P95、文字结构、
-  straightness、边缘、角点、masked fold 和 invalid rate 的配置化联合分数。
+- checkpoint 使用 EPE、P95、文字结构、straightness、边缘、角点、masked
+  fold 和 invalid rate 的配置化联合分数；只有同时通过相对 Stage-A 的
+  geometry criteria 才能写入 `best.pt`。
+
+Stage-A parity 从旧 checkpoint 的 `config.model` 读取 global-pose 开关，并
+调用旧工程 `UnifiedDocumentRectifier.forward(stage="prior")` 做同输入比较。
+当前 checkpoint 的配置和参数均证明 global pose 关闭，80/80 prior tensor
+严格加载，当前样本最大 map 差为 0。
+
+Qwen LoRA 运行时不再依赖外部 adapter 的隐式缩放规则，而是复用原
+DiffSynth 推理公式，把 `scale * (B @ A)` 直接合入每个 Linear。审计同时读取
+原训练脚本：rank 为 32，未显式设置 alpha，训练器因此使用 alpha=rank；
+scale=1 与原推理强度一致。
+`full_model_preflight.py` 还在真实 Qwen 输入上 hook `to_q/to_k`，将运行时
+输出与合并后 Linear 的直接计算比较，并把最大数值差写入预检报告。
