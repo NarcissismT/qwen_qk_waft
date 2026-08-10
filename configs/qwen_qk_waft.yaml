@@ -48,6 +48,8 @@ audit:
   ddp_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/ddp_bfloat16_preflight.json
   coordinate_precision_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/coordinate_precision.json
   full_model_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/full_model_preflight.json
+  phase_b_stability_report: ${QKWAFT_RUN_ROOT:-runs/qwen_qk_waft}/phase_b_stability_preflight.json
+  phase_b_stability_steps_per_iteration: 2
   full_model_layers: [0, 15, 30, 45]
   max_qk_projection_parity_error: 0.000001
   native_test_sizes: [2048, 4096]
@@ -119,6 +121,9 @@ train:
   amp: true
   amp_dtype: bfloat16
   grad_clip: 1.0
+  optimizer_epsilon: 0.00000001
+  warmup_fraction: 0.05
+  scheduler_extra_steps: 100
   log_every: 20
   val_samples: 64
   selection_weights:

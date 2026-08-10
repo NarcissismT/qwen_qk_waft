@@ -18,10 +18,14 @@ from tests.test_geometry import (
 from tests.test_formal_quality import test_ocr_character_retention_and_stage_a_gain
 from tests.test_infer import test_native_inference_resamples_rgb_exactly_once
 from tests.test_model import (
+    test_curriculum_iteration_count_does_not_rescale_sequence_loss,
     test_complete_forward_uses_absolute_backward_map,
     test_evaluation_reports_geometry_topology_and_calibration_metrics,
+    test_masked_mean_excludes_nonfinite_values_outside_valid_region,
+    test_nonfinite_loss_term_detection_reports_the_source,
     test_official_checkpoint_strictly_loads_vit_dpt_and_update_heads,
     test_official_waft_architecture_contract,
+    test_one_cycle_scheduler_starts_below_phase_peak_learning_rate,
     test_phase_transitions_preserve_the_previous_function,
     test_training_losses_are_finite_and_backpropagate,
     test_zero_flow_waft_core_matches_the_official_a2_update_equations,
@@ -52,6 +56,10 @@ def main() -> None:
         test_complete_forward_uses_absolute_backward_map,
         test_evaluation_reports_geometry_topology_and_calibration_metrics,
         test_training_losses_are_finite_and_backpropagate,
+        test_masked_mean_excludes_nonfinite_values_outside_valid_region,
+        test_curriculum_iteration_count_does_not_rescale_sequence_loss,
+        test_one_cycle_scheduler_starts_below_phase_peak_learning_rate,
+        test_nonfinite_loss_term_detection_reports_the_source,
         test_official_checkpoint_strictly_loads_vit_dpt_and_update_heads,
         test_official_waft_architecture_contract,
         test_phase_transitions_preserve_the_previous_function,

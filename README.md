@@ -47,7 +47,8 @@ ViT, DPTHead or update-head key does not load strictly.
 `scripts/train_slurm.sh` first runs fail-closed preflight checks for official
 WAFT loading, Stage-A full-model parity, Qwen LoRA scale semantics, 512/2K/4K
 FP32 coordinate behavior, a real Qwen-to-WAFT forward, 2-GPU 512px BF16 DDP,
-and the GT map coordinate contract. It then runs the planned phases in order:
+the GT map coordinate contract, and a real Phase-B `1 -> 3 -> 5` forward,
+backward and optimizer preflight. It then runs the planned phases in order:
 
 1. audit GT backward-map reconstruction;
 2. compare base Qwen and LoRA scales `0.25/0.5/0.75/1.0`, all 60 layers, all
@@ -69,21 +70,32 @@ calibration histogram. `best.pt` is written only when the configured geometry
 criteria improve over Stage-A without increasing fold/invalid rates or
 exceeding the high-confidence damage limit.
 
+WAFT training uses the official OneCycle warmup and linear decay rather than
+holding the peak learning rate for the whole run. Sequence and mixture-loss
+weights are normalized across the `1 -> 3 -> 5` curriculum so an iteration
+transition does not rescale the objective. Training logs the current step
+loss, every loss term, gradient norm, learning rate and iteration count. A
+non-finite loss or gradient is synchronized across ranks before the optimizer
+step, written to `numerical_failure.json` with the responsible sample IDs, and
+terminates the phase before parameters or Adam state can be contaminated.
+
 The optional Qwen-unfreezing experiment is deliberately not part of the
 default run.  The plan says it is only justified after the frozen descriptor
 run has converged and demonstrated a Qwen feature bottleneck.
 
-## Direct Slurm launch
+## Training entrypoint
 
-From this directory on a Slurm login node:
+Configure Slurm resources and the container in the outer job, then execute this
+training payload inside that environment:
 
 ```bash
 bash scripts/train_slurm.sh
 ```
 
-The script requests one node with eight GPUs, enters the established
-`diffsynth:v2-diffusers` container, launches eight independent frozen-Qwen
-workers with `torchrun`, and writes:
+The script contains no `srun`, resource request, or container configuration.
+It launches the requested training phases with `torchrun` on the GPUs exposed
+by the outer job. The default is eight workers; override it with
+`QKWAFT_NPROC_PER_NODE` when needed. It writes:
 
 - log: `runs/qwen_qk_waft/train.log`
 - official initialization report: `runs/qwen_qk_waft/official_waft_initialization.json`
@@ -92,6 +104,7 @@ workers with `torchrun`, and writes:
 - 512/2K/4K precision report: `runs/qwen_qk_waft/coordinate_precision.json`
 - real full-model report: `runs/qwen_qk_waft/full_model_preflight.json`
 - 2-GPU BF16 DDP report: `runs/qwen_qk_waft/ddp_bfloat16_preflight.json`
+- real Phase-B curriculum report: `runs/qwen_qk_waft/phase_b_stability_preflight.json`
 - coordinate audit: `runs/qwen_qk_waft/phase0_audit.json`
 - Q/K selection: `runs/qwen_qk_waft/phase1_probe/selection.json`
 - final checkpoint: `runs/qwen_qk_waft/phase5_confidence_gate/best.pt`

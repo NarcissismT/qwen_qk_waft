@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -91,6 +92,115 @@ def _save(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+
+
+def _trainable_parameters(model: nn.Module) -> list[nn.Parameter]:
+    return [parameter for parameter in model.parameters() if parameter.requires_grad]
+
+
+def _loss_values(losses: Mapping[str, Tensor]) -> dict[str, float | str]:
+    values: dict[str, float | str] = {}
+    for name, value in losses.items():
+        scalar = float(value.detach())
+        if math.isnan(scalar):
+            values[name] = "nan"
+        elif math.isinf(scalar):
+            values[name] = "inf" if scalar > 0 else "-inf"
+        else:
+            values[name] = scalar
+    return values
+
+
+def _nonfinite_loss_terms(losses: Mapping[str, Tensor]) -> list[str]:
+    return [
+        name
+        for name, value in losses.items()
+        if not bool(torch.isfinite(value.detach()).all())
+    ]
+
+
+def _tensor_diagnostics(value: Tensor) -> dict[str, float | int | list[int]]:
+    detached = value.detach().float()
+    finite = torch.isfinite(detached)
+    finite_count = int(finite.sum())
+    maximum = float(detached[finite].abs().max()) if finite_count else 0.0
+    return {
+        "shape": list(detached.shape),
+        "finite_count": finite_count,
+        "element_count": detached.numel(),
+        "maximum_finite_absolute_value": maximum,
+    }
+
+
+def _batch_ids(batch: Mapping[str, Any]) -> list[str]:
+    value = batch.get("id", [])
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def _abort_on_numerical_failure(
+    local_failure: dict[str, Any] | None,
+    *,
+    rank: int,
+    world: int,
+    device: torch.device,
+    output_dir: Path,
+) -> None:
+    status = torch.tensor(
+        int(local_failure is None), device=device, dtype=torch.int32
+    )
+    if world > 1:
+        dist.all_reduce(status, op=dist.ReduceOp.MIN)
+    if bool(status.item()):
+        return
+
+    failures: list[dict[str, Any] | None] = [None] * world
+    if world > 1:
+        dist.all_gather_object(failures, local_failure)
+    else:
+        failures[0] = local_failure
+    report = {
+        "passed": False,
+        "reason": "nonfinite_training_state",
+        "failures": [failure for failure in failures if failure is not None],
+    }
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "numerical_failure.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(report))
+    if world > 1:
+        dist.destroy_process_group()
+    raise FloatingPointError(
+        "non-finite Phase training state; inspect numerical_failure.json"
+    )
+
+
+def _build_optimizer_and_scheduler(
+    model: nn.Module,
+    phase: Mapping[str, Any],
+    train_config: Mapping[str, Any],
+    *,
+    steps_per_epoch: int,
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
+    optimizer = torch.optim.AdamW(
+        _trainable_parameters(model),
+        lr=float(phase["learning_rate"]),
+        weight_decay=float(phase["weight_decay"]),
+        eps=float(train_config["optimizer_epsilon"]),
+    )
+    scheduled_steps = int(phase["epochs"]) * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=float(phase["learning_rate"]),
+        total_steps=scheduled_steps + int(train_config["scheduler_extra_steps"]),
+        pct_start=float(train_config["warmup_fraction"]),
+        cycle_momentum=False,
+        anneal_strategy="linear",
+    )
+    return optimizer, scheduler
 
 
 def train_confidence(config_path: str | Path) -> None:
@@ -513,19 +623,30 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
     train_model: nn.Module = model
     if world > 1:
         train_model = DistributedDataParallel(model, device_ids=[device.index])
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=float(phase["learning_rate"]),
-        weight_decay=float(phase["weight_decay"]),
+    optimizer, scheduler = _build_optimizer_and_scheduler(
+        model,
+        phase,
+        config["train"],
+        steps_per_epoch=len(train_loader),
     )
+    trainable_parameters = _trainable_parameters(model)
     qwen_config = dict(config["qwen"])
     qwen_config["lora_scale"] = float(selection["lora_scale"])
-    variants = ("pre", "post") if selection["variant"] == "pre_post" else (selection["variant"],)
-    amp_dtype = torch.bfloat16 if config["train"]["amp_dtype"] == "bfloat16" else torch.float16
+    variants = (
+        ("pre", "post")
+        if selection["variant"] == "pre_post"
+        else (selection["variant"],)
+    )
+    amp_dtype = (
+        torch.bfloat16
+        if config["train"]["amp_dtype"] == "bfloat16"
+        else torch.float16
+    )
     output_dir = resolve_path(config, phase["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     best_value = float("inf")
     best_saved = False
+    global_step = 0
     with QwenQKExtractor(
         qwen_config,
         device=device,
@@ -539,6 +660,18 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
             train_model.train()
             running = 0.0
             iterations = _phase_iterations(phase, epoch)
+            if rank == 0:
+                print(
+                    json.dumps(
+                        {
+                            "phase": phase_name,
+                            "epoch": epoch,
+                            "event": "epoch_start",
+                            "iterations": iterations,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                        }
+                    )
+                )
             for step, raw_batch in enumerate(train_loader, 1):
                 batch = _to_device(raw_batch, device)
                 queries, keys, _, _ = extractor.selected_pair(
@@ -547,7 +680,11 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                     step=int(selection["step"]),
                     variant=str(selection["variant"]),
                 )
-                with torch.autocast("cuda", dtype=amp_dtype, enabled=bool(config["train"]["amp"])):
+                with torch.autocast(
+                    "cuda",
+                    dtype=amp_dtype,
+                    enabled=bool(config["train"]["amp"]),
+                ):
                     prediction = train_model(
                         batch["warped"],
                         queries,
@@ -572,21 +709,77 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                         min_jacobian=float(config["loss"]["min_jacobian"]),
                     )
                 optimizer.zero_grad(set_to_none=True)
+                nonfinite_terms = _nonfinite_loss_terms(losses)
+                loss_failure = None
+                if nonfinite_terms:
+                    loss_failure = {
+                        "rank": rank,
+                        "phase": phase_name,
+                        "epoch": epoch,
+                        "step": step,
+                        "global_step": global_step,
+                        "iterations": iterations,
+                        "sample_ids": _batch_ids(batch),
+                        "stage": "forward_loss",
+                        "nonfinite_loss_terms": nonfinite_terms,
+                        "losses": _loss_values(losses),
+                        "final_map": _tensor_diagnostics(prediction["final_map"]),
+                    }
+                _abort_on_numerical_failure(
+                    loss_failure,
+                    rank=rank,
+                    world=world,
+                    device=device,
+                    output_dir=output_dir,
+                )
                 losses["total"].backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters,
                     float(config["train"]["grad_clip"]),
                 )
+                gradient_failure = None
+                if not bool(torch.isfinite(grad_norm)):
+                    gradient_failure = {
+                        "rank": rank,
+                        "phase": phase_name,
+                        "epoch": epoch,
+                        "step": step,
+                        "global_step": global_step,
+                        "iterations": iterations,
+                        "sample_ids": _batch_ids(batch),
+                        "stage": "backward_gradient",
+                        "gradient_norm": _loss_values({"gradient_norm": grad_norm})[
+                            "gradient_norm"
+                        ],
+                        "losses": _loss_values(losses),
+                        "final_map": _tensor_diagnostics(prediction["final_map"]),
+                    }
+                _abort_on_numerical_failure(
+                    gradient_failure,
+                    rank=rank,
+                    world=world,
+                    device=device,
+                    output_dir=output_dir,
+                )
                 optimizer.step()
+                scheduler.step()
+                global_step += 1
                 running += float(losses["total"].detach())
                 if rank == 0 and step % int(config["train"]["log_every"]) == 0:
+                    loss_values = _loss_values(losses)
                     print(
                         json.dumps(
                             {
                                 "phase": phase_name,
                                 "epoch": epoch,
                                 "step": step,
+                                "global_step": global_step,
+                                "iterations": iterations,
                                 "loss": running / step,
+                                "step_loss": loss_values.pop("total"),
+                                "loss_terms": loss_values,
+                                "gradient_norm": float(grad_norm),
+                                "learning_rate": optimizer.param_groups[0]["lr"],
                             }
                         )
                     )
@@ -616,6 +809,8 @@ def train_waft(config_path: str | Path, phase_name: str) -> None:
                     "initialization": model.initialization_report,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "global_step": global_step,
                     "metrics": metrics,
                 }
                 _save(output_dir / "latest.pt", payload)

@@ -1,11 +1,15 @@
 import torch
 
 from qwen_qk_waft.geometry import pixel_grid, sample_feature_at_displacement
-from qwen_qk_waft.losses import bending_loss, compute_losses
+from qwen_qk_waft.losses import bending_loss, compute_losses, masked_mean
 from qwen_qk_waft.models.model import QwenQKWAFT
 from qwen_qk_waft.metrics import text_line_fit_residual
 from qwen_qk_waft.official_waft import DPTHead, PatchEmbed
-from qwen_qk_waft.train import _evaluate
+from qwen_qk_waft.train import (
+    _build_optimizer_and_scheduler,
+    _evaluate,
+    _nonfinite_loss_terms,
+)
 
 
 TIMM_CHECKPOINT = (
@@ -86,6 +90,84 @@ def test_training_losses_are_finite_and_backpropagate() -> None:
     assert torch.isfinite(losses["total"])
     losses["total"].backward()
     assert model.dpt_q.adapters[0].projection.weight.grad is not None
+
+
+def test_masked_mean_excludes_nonfinite_values_outside_valid_region() -> None:
+    value = torch.tensor([[[[2.0, torch.nan]]]])
+    valid = torch.tensor([[[[True, False]]]])
+    torch.testing.assert_close(masked_mean(value, valid), torch.tensor(2.0))
+
+
+def test_curriculum_iteration_count_does_not_rescale_sequence_loss() -> None:
+    target_map = pixel_grid(1, 8, 8, device="cpu", dtype=torch.float32)
+    prediction = target_map + 0.25
+    info = torch.zeros(1, 4, 8, 8)
+    batch = {
+        "map": target_map,
+        "valid": torch.ones(1, 1, 8, 8, dtype=torch.bool),
+        "target": torch.zeros(1, 3, 8, 8),
+    }
+
+    def output(iterations: int) -> dict[str, object]:
+        return {
+            "maps": [prediction] * iterations,
+            "infos": [info] * iterations,
+            "final_map": prediction,
+            "coarse_map": target_map,
+            "coarse_confidence": torch.ones(1, 1, 8, 8),
+            "gates": [],
+            "rectified": torch.zeros(1, 3, 8, 8),
+        }
+
+    one = compute_losses(
+        output(1),
+        batch,
+        {"sequence": 1.0, "uncertainty": 0.05},
+        sequence_gamma=0.85,
+        gate_temperature_px=3.0,
+        required_improvement_px=0.5,
+        min_jacobian=0.05,
+    )
+    five = compute_losses(
+        output(5),
+        batch,
+        {"sequence": 1.0, "uncertainty": 0.05},
+        sequence_gamma=0.85,
+        gate_temperature_px=3.0,
+        required_improvement_px=0.5,
+        min_jacobian=0.05,
+    )
+    torch.testing.assert_close(one["sequence"], five["sequence"])
+    torch.testing.assert_close(one["uncertainty"], five["uncertainty"])
+    torch.testing.assert_close(one["total"], five["total"])
+
+
+def test_one_cycle_scheduler_starts_below_phase_peak_learning_rate() -> None:
+    model = torch.nn.Linear(4, 4)
+    phase = {
+        "epochs": 2,
+        "learning_rate": 4.0e-4,
+        "weight_decay": 1.0e-5,
+    }
+    train = {
+        "optimizer_epsilon": 1.0e-8,
+        "warmup_fraction": 0.05,
+        "scheduler_extra_steps": 100,
+    }
+    optimizer, scheduler = _build_optimizer_and_scheduler(
+        model, phase, train, steps_per_epoch=100
+    )
+    assert optimizer.param_groups[0]["lr"] < phase["learning_rate"]
+    assert scheduler.total_steps == 300
+
+
+def test_nonfinite_loss_term_detection_reports_the_source() -> None:
+    losses = {
+        "total": torch.tensor(torch.nan),
+        "sequence": torch.tensor(1.0),
+        "uncertainty": torch.tensor(torch.inf),
+    }
+    assert _nonfinite_loss_terms(losses) == ["total", "uncertainty"]
 
 
 def test_official_checkpoint_strictly_loads_vit_dpt_and_update_heads() -> None:
